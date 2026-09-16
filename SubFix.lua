@@ -24,7 +24,7 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.3.1"
+SUBFIX_VERSION = "3.3.2"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -18027,12 +18027,26 @@ return ui:VGroup({
             ui:Button({ID = "UpdateBtn", Text = "📝 更新时间线", Weight = 1, MinimumSize = {0, 36}})
         }),
         ui:VGap(2),
-        ui:Label({
-            ID = "StatusLabel",
-            Text = "准备就绪",
+        ui:HGroup({
+            ID = "StatusRow",
             Weight = 0,
+            Spacing = 8,
             MinimumSize = {0, 18},
-            Alignment = {AlignLeft = true, AlignVCenter = true}
+            ui:Label({
+                ID = "StatusLabel",
+                Text = "准备就绪",
+                Weight = 1,
+                MinimumSize = {0, 18},
+                WordWrap = true,
+                Alignment = {AlignLeft = true, AlignVCenter = true}
+            }),
+            ui:Label({
+                ID = "VersionLabel",
+                Text = "v" .. SUBFIX_VERSION,
+                Weight = 0,
+                MinimumSize = {64, 18},
+                Alignment = {AlignRight = true, AlignVCenter = true}
+            })
         })
     })
 })

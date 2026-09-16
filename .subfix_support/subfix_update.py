@@ -81,6 +81,9 @@ def release_to_update_info(release: dict[str, Any], current_version: str) -> dic
         for asset in assets
         if isinstance(asset, dict) and str(asset.get("browser_download_url") or "").startswith("https://")
     }
+    # Older updaters use the default legacy-compatible asset names.
+    if all(asset_urls.get(prefix + "-full" + suffix) for suffix in (".zip", ".sha256")):
+        prefix += "-full"
     zip_url = asset_urls.get(prefix + ".zip")
     sha256_url = asset_urls.get(prefix + ".sha256")
     if not zip_url or not sha256_url:
