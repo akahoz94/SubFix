@@ -131,10 +131,10 @@ r = g.subfix_ensure_dir(str(ascii_dir).replace("\\", "/"))
 check("ensure_dir: ASCII 多级目录创建成功", ascii_dir.is_dir() and r is not None)
 
 cn_dir = Path(tempfile.gettempdir()) / "subfix_qa_mkdir_中文路径" / "inner"
-print("  （中文路径：cmd/io 均 GBK 解读同一 UTF-8 字节串 → 内部自洽但系统侧目录名乱码，属已知限制）")
+print("  （FFI 生效：中文路径直接 CreateDirectoryW，python Unicode 视角应真实存在）")
 r_cn = g.subfix_ensure_dir(str(cn_dir).replace("\\", "/"))
-check("ensure_dir: 中文路径不崩溃（返回布尔，功能自洽）", r_cn is True or r_cn is False, repr(r_cn))
-check("ensure_dir: 证实边界——python 视角正确 Unicode 名不存在（乱码名）", not cn_dir.exists())
+check("ensure_dir: 中文路径不崩溃（返回布尔）", r_cn is True or r_cn is False, repr(r_cn))
+check("ensure_dir: 中文目录 python 视角真实存在(FFI 根治)", cn_dir.exists())
 
 # ---------- 6. kill_tree 真实终止进程树 ----------
 work = Path(tempfile.mkdtemp(prefix="subfix_qa_kill_"))

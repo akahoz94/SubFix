@@ -62,10 +62,12 @@ except Exception as exc:
 g = test_lua.globals()
 check("SUBFIX_IS_WINDOWS 为 true（本机）", bool(g.SUBFIX_IS_WINDOWS))
 
-# subfix_ensure_dir 在 Windows 上应发 cmd 版 mkdir
-g.subfix_ensure_dir("C:/tmp dir/子目录")
-lines = [str(v) for v in g.EXECUTED.values()]
-check("subfix_ensure_dir 用 mkdir+反斜杠", any('mkdir "C:\\tmp dir\\子目录" 2>nul' in ln for ln in lines), str(lines[-1:]))
+# subfix_ensure_dir：FFI 下直接 CreateDirectoryW（不发 cmd mkdir），验证真实建目录
+ensure_target = Path(tempfile.gettempdir()) / "subfix_compat_ensdir" / "层级"
+import shutil as _shutil
+_shutil.rmtree(ensure_target.parent.parent, ignore_errors=True)
+g.subfix_ensure_dir(str(ensure_target))
+check("subfix_ensure_dir 真实创建多级目录(FFI)", ensure_target.is_dir())
 
 # subfix_kill_tree 应发 taskkill
 g.subfix_kill_tree(4321)

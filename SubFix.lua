@@ -30,11 +30,150 @@ pcall(require, "utf8")
 -- 使用全局命名空间以避开主 chunk 的 Lua 5.1 local 槽位上限。
 SUBFIX_IS_WINDOWS = package.config:sub(1, 1) == "\\"
 
+-- FFI(UTF-16)层：Resolve Windows 内嵌 LuaJIT，可调 W 系 API 把路径边界统一为 UTF-8，
+-- 根治中文路径（cmd/io 按 GBK 解读 UTF-8 字节导致的乱码与错位）。不可用时回退 ANSI 行为。
+SUBFIX_WIN_FFI = false
+if SUBFIX_IS_WINDOWS then
+    local ffi_ok, ffi_mod = pcall(require, "ffi")
+    if ffi_ok and ffi_mod and ffi_mod.os == "Windows" then
+        SUBFIX_WIN_FFI = true
+        SUBFIX_FFI = ffi_mod
+        ffi_mod.cdef[[
+            int MultiByteToWideChar(unsigned int CodePage, unsigned long dwFlags, const char *lpMultiByteStr, int cbMultiByte, wchar_t *lpWideCharStr, int cchWideChar);
+            int WideCharToMultiByte(unsigned int CodePage, unsigned long dwFlags, const wchar_t *lpWideCharStr, int cchWideChar, char *lpMultiByteStr, int cbMultiByte, const char *lpDefaultChar, int *lpUsedDefaultChar);
+            int CreateDirectoryW(const wchar_t *lpPathName, void *lpSecurityAttributes);
+            unsigned long GetFileAttributesW(const wchar_t *lpFileName);
+            unsigned long GetShortPathNameW(const wchar_t *lpszLongPath, wchar_t *lpszShortPath, unsigned long cchBuffer);
+            unsigned long GetEnvironmentVariableW(const wchar_t *lpName, wchar_t *lpBuffer, unsigned long nSize);
+            void *FindFirstFileW(const wchar_t *lpFileName, void *lpFindFileData);
+            int FindNextFileW(void *hFindFile, void *lpFindFileData);
+            int FindClose(void *hFindFile);
+            typedef unsigned long DWORD;
+            typedef struct { DWORD dwFileAttributes; DWORD ftCreationTime_l; DWORD ftCreationTime_h; DWORD ftLastAccessTime_l; DWORD ftLastAccessTime_h; DWORD ftLastWriteTime_l; DWORD ftLastWriteTime_h; DWORD nFileSizeHigh; DWORD nFileSizeLow; DWORD dwReserved0; DWORD dwReserved1; wchar_t cFileName[260]; wchar_t cAlternateFileName[14]; } WIN32_FIND_DATAW;
+            void *CreateFileW(const wchar_t *lpFileName, unsigned long dwDesiredAccess, unsigned long dwShareMode, void *lpSecurityAttributes, unsigned long dwCreationDisposition, unsigned long dwFlagsAndAttributes, void *hTemplateFile);
+            int WriteFile(void *hFile, const char *lpBuffer, unsigned long nNumberOfBytesToWrite, unsigned long *lpNumberOfBytesWritten, void *lpOverlapped);
+            int CloseHandle(void *hObject);
+            int CreateProcessW(const wchar_t *lpApplicationName, wchar_t *lpCommandLine, void *lpProcessAttributes, void *lpThreadAttributes, int bInheritHandles, unsigned long dwCreationFlags, void *lpEnvironment, const wchar_t *lpCurrentDirectory, void *lpStartupInfo, void *lpProcessInformation);
+            typedef struct { DWORD cb; wchar_t *lpReserved; wchar_t *lpDesktop; wchar_t *lpTitle; DWORD dwX; DWORD dwY; DWORD dwXSize; DWORD dwYSize; DWORD dwXCountChars; DWORD dwYCountChars; DWORD dwFillAttribute; DWORD dwFlags; unsigned short wShowWindow; unsigned short cbReserved2; unsigned char *lpReserved2; void *hStdInput; void *hStdOutput; void *hStdError; } STARTUPINFOW;
+            typedef struct { void *hProcess; void *hThread; DWORD dwProcessId; DWORD dwThreadId; } PROCESS_INFORMATION;
+        ]]
+        local CP_UTF8 = 65001
+        local INVALID_ATTR = 0xFFFFFFFF
+
+        function subfix_utf8_to_wide(s)
+            s = tostring(s or "")
+            if s == "" then return nil end
+            local wlen = SUBFIX_FFI.C.MultiByteToWideChar(CP_UTF8, 0, s, #s, nil, 0)
+            if wlen <= 0 then return nil end
+            local buf = SUBFIX_FFI.new("wchar_t[?]", wlen + 1)
+            SUBFIX_FFI.C.MultiByteToWideChar(CP_UTF8, 0, s, #s, buf, wlen)
+            buf[wlen] = 0
+            return buf
+        end
+
+        function subfix_wide_to_utf8(wbuf)
+            if not wbuf then return "" end
+            local len = 0
+            while wbuf[len] ~= 0 do len = len + 1 end
+            local clen = SUBFIX_FFI.C.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, nil, 0, nil, nil)
+            if clen <= 0 then return "" end
+            local buf = SUBFIX_FFI.new("char[?]", clen + 1)
+            SUBFIX_FFI.C.WideCharToMultiByte(CP_UTF8, 0, wbuf, len, buf, clen, nil, nil)
+            return SUBFIX_FFI.string(buf)
+        end
+
+        -- 存在性（文件与目录）；替代 io.open 探测以支持 UTF-8 中文路径
+        function subfix_native_file_exists(utf8path)
+            local w = subfix_utf8_to_wide(subfix_cmd_path(utf8path))
+            if not w then return false end
+            return SUBFIX_FFI.C.GetFileAttributesW(w) ~= INVALID_ATTR
+        end
+
+        -- 递归建目录（CreateDirectoryW 逐级），成功返回 true
+        function subfix_native_ensure_dir(utf8path)
+            local clean = tostring(utf8path or ""):gsub("[/\\]+$", "")
+            if clean == "" then return false end
+            local prefix = clean:match("^([A-Za-z]:)")
+            local rest = prefix and clean:sub(#prefix + 1) or clean
+            for seg in rest:gmatch("[^/\\]+") do
+                if prefix and prefix:match("^[A-Za-z]:$") then
+                    prefix = prefix .. "\\" .. seg
+                elseif prefix == "" then
+                    prefix = seg
+                else
+                    prefix = prefix .. "\\" .. seg
+                end
+                local w = subfix_utf8_to_wide(prefix)
+                if w then SUBFIX_FFI.C.CreateDirectoryW(w, nil) end
+            end
+            return subfix_native_file_exists(clean)
+        end
+
+        -- 8.3 短路径（用于喂给 cmd 的文件路径），不可用返回 nil
+        function subfix_native_short_path(utf8path)
+            local w = subfix_utf8_to_wide(subfix_cmd_path(utf8path))
+            if not w then return nil end
+            local n = SUBFIX_FFI.C.GetShortPathNameW(w, nil, 0)
+            if n == 0 then return nil end
+            local buf = SUBFIX_FFI.new("wchar_t[?]", n)
+            SUBFIX_FFI.C.GetShortPathNameW(w, buf, n)
+            return subfix_wide_to_utf8(buf)
+        end
+
+        -- 以 UTF-8 读环境变量（getenv 返回 ANSI 字节，中文用户名下会与 UTF-8 字符串错位）
+        function subfix_env_w(name)
+            local wname = subfix_utf8_to_wide(name)
+            if not wname then return nil end
+            local n = SUBFIX_FFI.C.GetEnvironmentVariableW(wname, nil, 0)
+            if n == 0 then return nil end
+            local buf = SUBFIX_FFI.new("wchar_t[?]", n)
+            SUBFIX_FFI.C.GetEnvironmentVariableW(wname, buf, n)
+            return subfix_wide_to_utf8(buf)
+        end
+
+        -- 以 UTF-8 路径创建并写入文件（io.open 走 ANSI，中文路径必败）
+        function subfix_write_file_w(utf8path, data)
+            local w = subfix_utf8_to_wide(subfix_cmd_path(utf8path))
+            if not w then return false end
+            -- GENERIC_WRITE = 0x40000000, CREATE_ALWAYS = 2
+            local h = SUBFIX_FFI.C.CreateFileW(w, 0x40000000, 0, nil, 2, 0x80, nil)
+            if h == nil or h == SUBFIX_FFI.cast("void *", -1) then return false end
+            local written = SUBFIX_FFI.new("unsigned long[1]")
+            local ok = SUBFIX_FFI.C.WriteFile(h, data, #data, written, nil)
+            SUBFIX_FFI.C.CloseHandle(h)
+            return ok ~= 0 and written[0] == #data
+        end
+
+        -- 以 UTF-8 命令行启动分离进程，返回 PID（失败 nil）。
+        -- 用于后台批处理：绕开 system() 的 ANSI 命令行限制，并直接获得 cmd.exe PID。
+        function subfix_start_process_w(utf8_command)
+            local wcmd = subfix_utf8_to_wide(utf8_command)
+            if not wcmd then return nil end
+            local si = SUBFIX_FFI.new("STARTUPINFOW")
+            si.cb = SUBFIX_FFI.sizeof(si)
+            local pi = SUBFIX_FFI.new("PROCESS_INFORMATION")
+            -- CREATE_NO_WINDOW = 0x08000000
+            local ok = SUBFIX_FFI.C.CreateProcessW(nil, wcmd, nil, nil, 0, 0x08000000, nil, nil, si, pi)
+            if ok == 0 then return nil end
+            local pid = tonumber(pi.dwProcessId)
+            SUBFIX_FFI.C.CloseHandle(pi.hProcess)
+            SUBFIX_FFI.C.CloseHandle(pi.hThread)
+            return pid
+        end
+    end
+end
+
 function subfix_home_dir()
+    if SUBFIX_WIN_FFI then
+        return subfix_env_w("USERPROFILE") or os.getenv("HOME") or os.getenv("USERPROFILE") or ""
+    end
     return os.getenv("HOME") or os.getenv("USERPROFILE") or ""
 end
 
 function subfix_temp_root()
+    if SUBFIX_WIN_FFI then
+        return subfix_env_w("TEMP") or subfix_env_w("TMP") or "C:/Windows/Temp"
+    end
     if SUBFIX_IS_WINDOWS then
         return os.getenv("TEMP") or os.getenv("TMP") or "C:/Windows/Temp"
     end
@@ -57,6 +196,11 @@ function subfix_sleep(seconds)
 end
 
 function subfix_ensure_dir(path)
+    if SUBFIX_WIN_FFI then
+        if subfix_native_ensure_dir(path) then return true end
+        print("[SubFix] 无法创建目录: " .. tostring(path))
+        return false
+    end
     if not SUBFIX_IS_WINDOWS then
         local s = tostring(path or "")
         os.execute("mkdir -p '" .. s:gsub("'", "'\\''") .. "' 2>/dev/null")
@@ -97,15 +241,27 @@ function subfix_kill_tree(pid)
     end
 end
 
+-- FFI 下把「已存在父目录 + ASCII 文件名」的路径整体转为 ASCII 短路径，
+-- 让批处理内容里的重定向/记录路径不依赖 chcp 对 UTF-8 的解读。失败返回 nil。
+function subfix_ascii_safe_path(p)
+    if not SUBFIX_WIN_FFI then return nil end
+    p = tostring(p or "")
+    local dir = p:match("^(.*)[/\\]")
+    local name = p:match("[/\\]([^/\\]+)$")
+    if not dir or not name or not name:match("^[%w%.%-%_]+$") then return nil end
+    local short = subfix_native_short_path(dir)
+    if not short then return nil end
+    return short .. "\\" .. name
+end
+
 -- Windows 后台任务：把命令写进 .cmd 批处理（含退出码/完成标记落盘），
 -- 再用 start /b 拉起。批处理先借 powershell 把自身 cmd.exe 的 PID 写入 pid 文件，
 -- 取消时 taskkill /T 连带杀掉 python/curl 子进程。
--- ponytail: 批处理按 UTF-8 + chcp 65001 写出，依赖 cmd 在中文路径下按 65001 解析；
--- 如遇罕见代码页问题，升级方向是改由 PowerShell -File 启动整个批处理。
+-- ponytail: 批处理按 UTF-8 + chcp 65001 写出（cmd_line 中的中文路径依赖它）；
+-- 临时文件路径优先短路径化（subfix_ascii_safe_path），中文目录下双保险。
 function subfix_write_bg_batch(batch_file, cmd_line, options)
     options = type(options) == "table" and options or {}
-    local handle = io.open(batch_file, "wb")
-    if not handle then return false end
+    local safe = function(p) return subfix_ascii_safe_path(p) or subfix_cmd_path(p) end
     local lines = {
         "@echo off",
         "chcp 65001 >nul",
@@ -116,23 +272,43 @@ function subfix_write_bg_batch(batch_file, cmd_line, options)
         lines[#lines + 1] = 'set "' .. tostring(pair.name) .. '=' .. tostring(pair.value) .. '"'
     end
     if options.pid_file and options.pid_file ~= "" then
-        lines[#lines + 1] = string.format(
-            'powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter (\'ProcessId=\' + $PID)).ParentProcessId | Set-Content -LiteralPath \'%s\'" >nul 2>&1',
-            subfix_cmd_path(options.pid_file))
+        local pid_line = 'powershell -NoProfile -Command "(Get-CimInstance Win32_Process'
+            .. ' -Filter (\'ProcessId=\' + $PID)).ParentProcessId | Set-Content -LiteralPath \'%s\'" >nul 2>&1'
+        lines[#lines + 1] = string.format(pid_line, safe(options.pid_file))
     end
-    lines[#lines + 1] = string.format('%s > "%s" 2>&1', cmd_line, subfix_cmd_path(options.stdout_file or ""))
+    lines[#lines + 1] = string.format('%s > "%s" 2>&1', cmd_line, safe(options.stdout_file or ""))
     if options.exit_file and options.exit_file ~= "" then
-        lines[#lines + 1] = string.format('echo %%errorlevel%% > "%s"', subfix_cmd_path(options.exit_file))
+        lines[#lines + 1] = string.format('echo %%errorlevel%% > "%s"', safe(options.exit_file))
     end
     if options.done_file and options.done_file ~= "" then
-        lines[#lines + 1] = string.format('type nul > "%s"', subfix_cmd_path(options.done_file))
+        lines[#lines + 1] = string.format('type nul > "%s"', safe(options.done_file))
     end
-    handle:write(table.concat(lines, "\r\n") .. "\r\n")
+    local content = table.concat(lines, "\r\n") .. "\r\n"
+    if SUBFIX_WIN_FFI then
+        -- 中文目录下 io.open(ANSI) 必败，用 CreateFileW 写
+        return subfix_write_file_w(batch_file, content)
+    end
+    local handle = io.open(subfix_cmd_path(batch_file), "wb")
+    if not handle then return false end
+    handle:write(content)
     handle:close()
     return true
 end
 
-function subfix_launch_bg_batch(batch_file)
+function subfix_launch_bg_batch(batch_file, pid_file)
+    if SUBFIX_WIN_FFI then
+        -- CreateProcessW 直启 cmd /c：UTF-8 路径全兼容，且直接拿到 cmd.exe PID
+        local pid = subfix_start_process_w('cmd.exe /c "' .. subfix_cmd_path(batch_file) .. '"')
+        if pid then
+            if pid_file and pid_file ~= "" then
+                subfix_write_file_w(pid_file, tostring(pid))
+            end
+            return pid
+        end
+        -- CreateProcess 失败时回退 start（短路径兜底）
+        local short = subfix_native_short_path(batch_file)
+        if short then batch_file = short end
+    end
     os.execute('start "SubFixBG" /b cmd /c "' .. subfix_cmd_path(batch_file) .. '"')
 end
 
@@ -1390,6 +1566,41 @@ function list_backup_files(limit)
 
     local file_limit = tonumber(limit) or BACKUP_HISTORY_LIMIT
     local files = {}
+    -- FFI 下用 FindFirstFileW 直接枚举：dir 输出是 GBK 字节，中文目录名会与
+    -- UTF-8 路径错位导致恢复链路失效；W 系枚举返回 UTF-8 名，与输入路径同编码。
+    if SUBFIX_WIN_FFI then
+        local FFI = SUBFIX_FFI
+        local pattern = subfix_cmd_path(current_backup_path) .. "\\*.srt"
+        local wpattern = subfix_utf8_to_wide(pattern)
+        if wpattern then
+            local fd = FFI.new("WIN32_FIND_DATAW")
+            local h = FFI.C.FindFirstFileW(wpattern, fd)
+            if h ~= nil then
+                local entries = {}
+                repeat
+                    local name = subfix_wide_to_utf8(fd.cFileName)
+                    if name ~= "" and name ~= "." and name ~= ".." then
+                        entries[#entries + 1] = {
+                            path = join_path(current_backup_path, name),
+                            stamp = fd.ftLastWriteTime_h * 4294967296 + fd.ftLastWriteTime_l
+                        }
+                    end
+                    local more = FFI.C.FindNextFileW(h, fd)
+                    -- 注意：Lua 中 0 为真值，必须显式 == 0 判断枚举结束
+                    if more == 0 or more == false then break end
+                until false
+                FFI.C.FindClose(h)
+                table.sort(entries, function(a, b) return a.stamp > b.stamp end)
+                for _, entry in ipairs(entries) do
+                    if is_history_backup_filename(entry.path) then
+                        files[#files + 1] = entry.path
+                        if #files >= file_limit then break end
+                    end
+                end
+                return files
+            end
+        end
+    end
     local handle = nil
     if package.config:sub(1,1) == "\\" then
         handle = io.popen('dir /b /o-d "' .. current_backup_path .. '\\*.srt" 2>nul')
@@ -8037,6 +8248,10 @@ end
 
 function SUBFIX_AUDIO_ALIGN.file_exists(path)
     if not path or tostring(path) == "" then return false end
+    if SUBFIX_WIN_FFI then
+        -- io.open 走 ANSI(GBK)，UTF-8 中文路径会误判；W 系按 UTF-16 精确判定
+        return subfix_native_file_exists(path)
+    end
     local handle = io.open(tostring(path), "rb")
     if handle then
         handle:close()
