@@ -167,3 +167,37 @@ def test_force_download_cleared_after_install(manager, tmp_path, monkeypatch):
     status = manager.install(paths, lambda stage, message, **kw: None)
     assert not (paths.data_root / ".subfix-force-download").exists()
     assert status.get("ready") is True
+
+
+def test_malformed_index_plus_single_file_is_rejected(manager, tmp_path, monkeypatch):
+    """畸形目录：config + index.json + 单文件 safetensors、缺分片。
+
+    transformers 见 index.json 即按索引加载分片，缺分片必然运行时失败——
+    管理器必须拒绝，否则 UI 报"检测到本机模型"而识别失败。"""
+    malformed = tmp_path / "Qwen3-ASR-1.7B-malformed"
+    malformed.mkdir()
+    for name in ("config.json", "model.safetensors.index.json", "model.safetensors"):
+        (malformed / name).write_bytes(b"x")
+    # 直接判定
+    assert manager.model_directory_is_complete(malformed) is False
+    # env 路径拒绝
+    monkeypatch.setenv("SUBFIX_QWEN3_ASR_MODEL", str(malformed))
+    paths = manager.SubFixQwenPaths(tmp_path / "root", tmp_path / "data")
+    assert manager.existing_model_dir(paths) is None
+    assert manager.has_model_artifacts(paths) is False
+    # data_root 路径同样拒绝（env 移除后走 data_root 分支）
+    monkeypatch.delenv("SUBFIX_QWEN3_ASR_MODEL", raising=False)
+    import shutil
+    shutil.copytree(malformed, paths.model_dir)
+    assert manager.existing_model_dir(paths) is None
+    # has_model_artifacts 对 data_root 仅做目录存在粗判（上游语义）；把关在
+    # existing_model_dir → inspect_install：畸形目录绝不能产生 ready 状态
+    status = manager.inspect_install(paths)
+    assert status.get("ready") is not True
+    assert status.get("state") in ("missing", "repair_required")
+
+
+def test_sharded_official_layout_still_accepted(manager, tmp_path, monkeypatch):
+    """官方分片形态（下载落盘的标准文件集）不受单文件排除逻辑影响。"""
+    model_dir = make_complete_model(tmp_path)
+    assert manager.model_directory_is_complete(model_dir) is True

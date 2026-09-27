@@ -3464,7 +3464,13 @@ end
 local function local_model_dir_complete(dir)
     if type(dir) ~= "string" or dir == "" then return false end
     if not file_exists(dir .. "/config.json") then return false end
-    return file_exists(dir .. "/model.safetensors.index.json") or file_exists(dir .. "/model.safetensors")
+    -- 与管理器 model_directory_is_complete 同标准：index.json 并存时按分片判定，
+    -- 畸形目录（index+单文件、缺分片）必须拒绝，否则 UI 报就绪而识别必然失败。
+    if file_exists(dir .. "/model.safetensors.index.json") then
+        return file_exists(dir .. "/model-00001-of-00002.safetensors")
+            and file_exists(dir .. "/model-00002-of-00002.safetensors")
+    end
+    return file_exists(dir .. "/model.safetensors")
 end
 
 local function probe_local_model_candidates()

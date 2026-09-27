@@ -92,6 +92,7 @@ __QA_EXPORT = {
     redownload = request_local_model_redownload,
     prefs_read = read_generate_preferences,
     resolve_aligner = resolve_local_aligner_model,
+    complete = local_model_dir_complete,
 }
 """
 final_return = core_src.rstrip().rfind("return SubFixGenerateSelectionCore")
@@ -123,6 +124,26 @@ asr_found = str(found.asr or "").replace("\\", "/")
 aligner_found = str(found.aligner or "").replace("\\", "/")
 check("probe: 识别模型命中 G:/AImodel", asr_found.endswith("G:/AImodel/Qwen3-ASR-1.7B"), asr_found)
 check("probe: 对齐模型命中 G:/AImodel", aligner_found.endswith("G:/AImodel/Qwen3-ForcedAligner-0.6B"), aligner_found)
+
+# ---------- 1.5 畸形目录拒绝（index+单文件、缺分片）——最小探针实测 ----------
+malformed = home_stub / "malformed-model"
+malformed.mkdir()
+for name in ("config.json", "model.safetensors.index.json", "model.safetensors"):
+    (malformed / name).write_bytes(b"x")
+check("畸形目录: 已构造", malformed.is_dir())
+mal_path = str(malformed).replace("\\", "/")
+check("probe: 畸形目录被拒绝（index 并存缺分片）",
+      lua.eval("function(f, d) return not f(d) end")(qa.complete, mal_path))
+# 正确分片目录应被接受（官方下载形态）
+sharded = home_stub / "sharded-model"
+sharded.mkdir()
+for name in ("config.json", "model.safetensors.index.json",
+             "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"):
+    (sharded / name).write_bytes(b"x")
+check("分片目录: 已构造", sharded.is_dir())
+sharded_path = str(sharded).replace("\\", "/")
+check("probe: 官方分片目录被接受",
+      lua.eval("function(f, d) return f(d) end")(qa.complete, sharded_path))
 
 # ---------- 2. offer（无 UI）：登记 + junction 命令 ----------
 chosen = qa.offer()

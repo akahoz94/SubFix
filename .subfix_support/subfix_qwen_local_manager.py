@@ -153,6 +153,9 @@ def model_directory_is_complete(model_dir: Path) -> bool:
         return True
     # 单文件 safetensors 形态：与 Lua 侧 local_model_dir_complete 的判定标准一致，
     # 避免 UI 探测通过（提示"检测到本机模型"）而 install 仍判定不完整并重复下载。
+    # index.json 并存时 transformers 按索引加载分片，单文件不会被使用——该畸形目录必须拒绝。
+    if model_dir.joinpath("model.safetensors.index.json").is_file():
+        return False
     return model_dir.joinpath("model.safetensors").is_file()
 
 
