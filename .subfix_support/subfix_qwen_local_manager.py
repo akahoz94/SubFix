@@ -24,6 +24,12 @@ else:
 
 QWEN_ASR_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
 QWEN_PYPI_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+# 清华镜像可能对高频请求返回 403（pip 会把它当"无可用版本"），按序回退
+PYPI_INDEX_FALLBACKS = (
+    QWEN_PYPI_INDEX_URL,
+    "https://mirrors.aliyun.com/pypi/simple/",
+    "https://pypi.org/simple",
+)
 MODEL_DOWNLOAD_SOURCES = (("modelscope", "魔搭国内源"), ("huggingface", "Hugging Face 备用源"))
 QWEN_ASR_REQUIRED_MODEL_FILES = (
     "config.json",
@@ -374,33 +380,49 @@ def create_or_reuse_venv(base_python: Path, env_dir: Path) -> None:
         run_checked([str(base_python), "-m", "venv", str(env_dir)], error_prefix="创建本地 Qwen 环境失败")
 
 
+def pip_install_with_index_fallback(env_python: Path, packages: list[str], error_prefix: str,
+                                    report: ProgressReporter | None, log_path: Path | None,
+                                    heartbeat: tuple[str, str] | None = None,
+                                    extra_args: list[str] | None = None) -> None:
+    """pip 安装，镜像按 清华→阿里云→官方 逐个回退。
+
+    清华 403 时 pip 报 "No matching distribution found"——按序换源重试，
+    全部失败才抛错（附上各镜像的错误摘要）。"""
+    errors: list[str] = []
+    for index_url in PYPI_INDEX_FALLBACKS:
+        command = [str(env_python), "-m", "pip", "install", "--upgrade",
+                   "--index-url", index_url,
+                   "--timeout", "60", "--retries", "5", "--disable-pip-version-check",
+                   "--no-input", "--progress-bar", "off", *(extra_args or []), *packages]
+        try:
+            run_checked(command, error_prefix=error_prefix, log_path=log_path,
+                        report=report, heartbeat=heartbeat)
+            return
+        except RuntimeError as exc:
+            message = str(exc)
+            errors.append(f"{index_url}: {message.splitlines()[0] if message else '失败'}")
+    raise RuntimeError(
+        f"{error_prefix}：所有镜像源均失败（可能是网络受限或镜像限流）。已尝试："
+        + "；".join(errors))
+
+
 def install_qwen_dependencies(env_python: Path, report: ProgressReporter, log_path: Path) -> None:
-    common = [str(env_python), "-m", "pip", "install", "--upgrade",
-              "--index-url", QWEN_PYPI_INDEX_URL,
-              "--timeout", "60", "--retries", "5", "--disable-pip-version-check",
-              "--no-input", "--progress-bar", "off"]
     # venv seeds pip 25.0.1; upgrading in the dependency command leaves that
     # same old process handling large downloads without resume support.
-    run_checked(
-        [*common, "pip>=25.2"],
+    pip_install_with_index_fallback(
+        env_python, ["pip>=25.2"],
         error_prefix="升级本地 Qwen 下载工具失败",
-        log_path=log_path,
         report=report,
+        log_path=log_path,
         heartbeat=("准备下载工具", "正在升级 pip，启用下载中断恢复"),
     )
-    run_checked(
-        [
-            *common,
-            "--resume-retries", "5",
-            "qwen-asr",
-            "torch",
-            "huggingface_hub",
-            "modelscope",
-        ],
+    pip_install_with_index_fallback(
+        env_python, ["qwen-asr", "torch", "huggingface_hub", "modelscope"],
         error_prefix="安装本地 Qwen 依赖失败",
-        log_path=log_path,
         report=report,
+        log_path=log_path,
         heartbeat=("安装依赖", "正在安装 qwen-asr 与 PyTorch，下载中断会自动重试，请保持网络连接"),
+        extra_args=["--resume-retries", "5"],
     )
 
 
@@ -429,9 +451,8 @@ def ensure_modelscope_downloader(env_python: Path, report: ProgressReporter, log
     except (OSError, subprocess.TimeoutExpired):
         pass
     # Older installations can already run Qwen but lack the domestic downloader.
-    run_checked(
-        [str(env_python), "-m", "pip", "install", "--upgrade", "--index-url", QWEN_PYPI_INDEX_URL,
-         "--timeout", "60", "--retries", "5", "--disable-pip-version-check", "--no-input", "modelscope"],
+    pip_install_with_index_fallback(
+        env_python, ["modelscope"],
         error_prefix="安装魔搭下载工具失败", log_path=log_path, report=report,
         heartbeat=("准备下载工具", "正在通过国内镜像安装魔搭下载工具"),
     )

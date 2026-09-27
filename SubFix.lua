@@ -312,7 +312,7 @@ function subfix_launch_bg_batch(batch_file, pid_file)
     os.execute('start "SubFixBG" /b cmd /c "' .. subfix_cmd_path(batch_file) .. '"')
 end
 
-SUBFIX_VERSION = "3.3.0"
+SUBFIX_VERSION = "3.4.0"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()

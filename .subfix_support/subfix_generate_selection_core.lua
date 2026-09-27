@@ -3963,12 +3963,126 @@ local function show_qwen_install_complete_dialog()
     complete_window:Show()
 end
 
+local function show_local_model_choice_for_install(found)
+    if not (dispatcher and ui) then return "local" end
+    local action = "cancel"
+    local detail_lines = {}
+    if found.asr then detail_lines[#detail_lines + 1] = "识别模型：" .. found.asr end
+    if found.aligner then detail_lines[#detail_lines + 1] = "对齐模型：" .. found.aligner end
+    local window = dispatcher:AddWindow({
+        ID = "GenerateQwenInstallChoiceWindow",
+        WindowTitle = "SubFix · 检测到本机模型",
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 340, 560, 190}),
+    },
+    ui:VGroup{
+        Spacing = 8,
+        ContentsMargins = 14,
+        ui:Label{Text = "检测到本机已有 Qwen 模型，安装将只装运行依赖、不重复下载模型：", Weight = 0},
+        ui:Label{Text = table.concat(detail_lines, "\n"), Weight = 0},
+        ui:HGroup{
+            Weight = 0,
+            MinimumSize = {0, 34},
+            ui:Button{ID = "QwenInstallChoiceLocalBtn", Text = "使用本机模型", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "QwenInstallChoiceRedownloadBtn", Text = "重新下载（联网）", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "QwenInstallChoiceOtherBtn", Text = "指定其他目录...", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "QwenInstallChoiceCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}}
+        }
+    })
+    function window.On.QwenInstallChoiceLocalBtn.Clicked(ev) action = "local" window:Hide() dispatcher:ExitLoop() end
+    function window.On.QwenInstallChoiceRedownloadBtn.Clicked(ev) action = "redownload" window:Hide() dispatcher:ExitLoop() end
+    function window.On.QwenInstallChoiceOtherBtn.Clicked(ev) action = "custom" window:Hide() dispatcher:ExitLoop() end
+    function window.On.QwenInstallChoiceCancelBtn.Clicked(ev) action = "cancel" window:Hide() dispatcher:ExitLoop() end
+    function window.On.GenerateQwenInstallChoiceWindow.Close(ev) action = "cancel" window:Hide() dispatcher:ExitLoop() end
+    window:Show()
+    dispatcher:RunLoop()
+    pcall(function() window:Hide() end)
+    return action
+end
+
+local function show_local_model_dir_input()
+    if not (dispatcher and ui) then return nil end
+    local result = nil
+    local window = dispatcher:AddWindow({
+        ID = "GenerateQwenLocalDirWindow",
+        WindowTitle = "SubFix · 指定本机模型目录",
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 340, 560, 150}),
+    },
+    ui:VGroup{
+        Spacing = 8,
+        ContentsMargins = 14,
+        ui:Label{Text = "输入本机模型目录（需含 config.json 与模型 safetensors）：", Weight = 0},
+        ui:TextEdit{ID = "QwenLocalDirInput", Text = "G:/AImodel/Qwen3-ASR-1.7B", Weight = 0, MinimumSize = {0, 28}},
+        ui:Label{ID = "QwenLocalDirHint", Text = "", Weight = 0},
+        ui:HGroup{
+            Weight = 0,
+            MinimumSize = {0, 34},
+            ui:Button{ID = "QwenLocalDirOkBtn", Text = "确定", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "QwenLocalDirCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}}
+        }
+    })
+    local input = window:Find("QwenLocalDirInput")
+    local hint = window:Find("QwenLocalDirHint")
+    function window.On.QwenLocalDirOkBtn.Clicked(ev)
+        local dir = trim_text(tostring(input.Text or ""))
+        if local_model_dir_complete(dir) then
+            result = dir
+            window:Hide()
+            dispatcher:ExitLoop()
+        else
+            hint.Text = "该目录缺少 config.json 或模型 safetensors 文件，请检查路径"
+        end
+    end
+    function window.On.QwenLocalDirCancelBtn.Clicked(ev) window:Hide() dispatcher:ExitLoop() end
+    function window.On.GenerateQwenLocalDirWindow.Close(ev) window:Hide() dispatcher:ExitLoop() end
+    window:Show()
+    dispatcher:RunLoop()
+    pcall(function() window:Hide() end)
+    return result
+end
+
 local function install_local_qwen_with_progress()
     local paths = resolve_asr_paths()
     local existing_status = inspect_local_qwen(paths)
     if existing_status.ready then
         show_qwen_install_complete_dialog()
         return true
+    end
+    -- 入口即给本机模型选择：探测 → 四选（用本机/重下/指定目录/取消）
+    local reuse_local = false
+    local saved = read_generate_preferences()
+    if local_model_dir_complete(trim_text(tostring(saved.local_asr_model or ""))) then
+        ensure_local_model_junction(trim_text(tostring(saved.local_asr_model)))
+        reuse_local = true
+    else
+        local found = probe_local_model_candidates()
+        local choice = nil
+        if found.asr or found.aligner then
+            choice = show_local_model_choice_for_install(found)
+        else
+            -- 无候选也允许手动指定目录
+            choice = "custom-offer"
+        end
+        if choice == "cancel" then return false, "已取消" end
+        if choice == "local" then
+            local data = read_generate_preferences()
+            if found.asr then data.local_asr_model = found.asr end
+            if found.aligner then data.local_aligner_model = found.aligner end
+            write_generate_preferences(data)
+            ensure_local_model_junction(found.asr or "")
+            reuse_local = true
+        elseif choice == "redownload" then
+            request_local_model_redownload()
+        elseif choice == "custom" or choice == "custom-offer" then
+            local custom_dir = show_local_model_dir_input()
+            if custom_dir == nil then return false, "已取消" end
+            local data = read_generate_preferences()
+            data.local_asr_model = custom_dir
+            local found2 = probe_local_model_candidates()
+            if found2.aligner then data.local_aligner_model = found2.aligner end
+            write_generate_preferences(data)
+            ensure_local_model_junction(custom_dir)
+            reuse_local = true
+        end
     end
     local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
     local root = temp_dir()
@@ -3978,7 +4092,11 @@ local function install_local_qwen_with_progress()
     if not cmd then return false, cmd_err end
     local progress_state, progress_err = show_generate_progress_window()
     if not progress_state then return false, progress_err end
-    update_generate_progress_window(progress_state, {stage = "准备下载", message = "正在准备本地 Qwen 安装", indeterminate = true})
+    if reuse_local then
+        update_generate_progress_window(progress_state, {stage = "准备安装", message = "已检测到本机模型，仅安装运行依赖（不下载模型）", indeterminate = true})
+    else
+        update_generate_progress_window(progress_state, {stage = "准备下载", message = "正在准备本地 Qwen 安装", indeterminate = true})
+    end
     local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state, env_pairs)
     subfix_remove_files(progress_path)
     local payload = decode_json_text(read_text_file(output_path) or "")
