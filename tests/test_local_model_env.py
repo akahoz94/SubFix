@@ -113,6 +113,19 @@ def test_install_reuses_env_model_without_download(manager, tmp_path, monkeypatc
     assert any("复用" in message for _, message in events)
 
 
+def test_single_file_model_is_accepted(manager, tmp_path, monkeypatch):
+    """单文件 safetensors 形态（Lua 探测 local_model_dir_complete 接受的形态）
+    必须同样被管理器识别为完整模型，否则 UI 提示"检测到本机模型"而 install 仍重复下载。"""
+    model_dir = tmp_path / "Qwen3-ASR-1.7B-single"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_bytes(b"x")
+    (model_dir / "model.safetensors").write_bytes(b"x")
+    monkeypatch.setenv("SUBFIX_QWEN3_ASR_MODEL", str(model_dir))
+    paths = manager.SubFixQwenPaths(tmp_path / "root", tmp_path / "data")
+    assert manager.existing_model_dir(paths) == model_dir
+    assert manager.has_model_artifacts(paths) is True
+
+
 def test_force_download_ignores_all_local_candidates(manager, tmp_path, monkeypatch):
     model_dir = make_complete_model(tmp_path)
     monkeypatch.setenv("SUBFIX_QWEN3_ASR_MODEL", str(model_dir))

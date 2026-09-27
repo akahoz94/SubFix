@@ -144,7 +144,16 @@ def python_can_import_qwen_asr(python: Path) -> bool:
 
 
 def model_directory_is_complete(model_dir: Path) -> bool:
-    return model_dir.is_dir() and all(model_dir.joinpath(name).is_file() for name in QWEN_ASR_REQUIRED_MODEL_FILES)
+    if not model_dir.is_dir():
+        return False
+    if not model_dir.joinpath("config.json").is_file():
+        return False
+    # 官方分片形态：index + 两个分片（download_model 落盘的标准文件集）
+    if all(model_dir.joinpath(name).is_file() for name in QWEN_ASR_REQUIRED_MODEL_FILES[1:]):
+        return True
+    # 单文件 safetensors 形态：与 Lua 侧 local_model_dir_complete 的判定标准一致，
+    # 避免 UI 探测通过（提示"检测到本机模型"）而 install 仍判定不完整并重复下载。
+    return model_dir.joinpath("model.safetensors").is_file()
 
 
 def huggingface_cache_roots() -> list[Path]:
