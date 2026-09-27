@@ -1,5 +1,13 @@
-"""Exercise the Lua launch command with host-owned output pipes."""
+"""Exercise the Lua launch command with host-owned output pipes.
 
+The asserted ``bg_cmd`` template is the POSIX (macOS) branch of
+``run_background_command_with_progress``; on Windows the same function launches
+a detached batch via ``subfix_write_bg_batch`` + ``subfix_launch_bg_batch``
+(CreateProcessW 直启 cmd /c，start 仅兜底), whose behaviour is covered end to
+end by ``test_win_compat.py``.
+"""
+
+import os
 from pathlib import Path
 import re
 import shlex
@@ -13,6 +21,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@unittest.skipUnless(os.name == "posix", "POSIX-only: /bin/sh launch template")
 class BackgroundLaunchTests(unittest.TestCase):
     def test_launcher_releases_host_pipes_before_worker_finishes(self):
         source = (ROOT / ".subfix_support/subfix_generate_selection_core.lua").read_text()

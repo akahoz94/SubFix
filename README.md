@@ -12,13 +12,29 @@ DaVinci Resolve 字幕插件的 Windows 移植版，基于上游 macOS v3.3.0（
 | `SubFix-v*-Windows-Max.zip` | Full + 自编译 qwen3-asr-cli 加速对齐（GGUF 模型） | 全离线 |
 | `SubFix-v*-Windows-Setup.exe` | Inno Setup 安装器（简体中文向导，可静默 `/VERYSILENT`） | 常规安装 |
 
-构建命令（`.build_cache` 缓存下载物）：
+构建命令（`.build_cache` 缓存下载物，产物统一输出到 `dist/`）：
 
 ```
 python build_windows_zip.py                       # 轻量
 python build_windows_zip.py --bundle-runtime      # Full
 python build_windows_zip.py --bundle-runtime --qwen-cpp <组装片段目录>   # Max
 python build_windows_zip.py --installer           # Setup.exe
+```
+
+## 仓库目录结构
+
+```
+SubFix-win/
+├── README.md / CHANGELOG.md     文档（根，GitHub 惯例）
+├── docs/                        其余文档（QA 报告等）
+├── installer/                   安装器脚本源（打包进 zip 顶层）
+│   ├── 安装_SubFix.bat / 安装_SubFix_系统级.bat
+│   ├── 卸载_SubFix.bat / 接入本地模型.bat
+├── dist/                        构建产物（zip/Setup.exe，不入版本库）
+├── SubFix.lua、生成选区字幕.lua、subfix_*.py、.subfix_support/   插件源码
+├── scripts/windows/             Windows 构建与打包脚本
+├── tests/                       pytest 套件 + 真机 QA 脚本
+└── build_windows_zip.py         构建入口
 ```
 
 qwen3-asr.cpp Windows 构建流程见 `scripts/windows/`（MinGW-w64 + CMake+Ninja；
@@ -50,8 +66,9 @@ Windows 轻量包不内置 Python 运行时与 FFmpeg（macOS 完整包内置）
   属于未接线的辅助代码；实际目标轨由插件 UI 的轨道下拉框经 Resolve API（mediaPool:AppendToTimeline 等）
   控制，Windows 上无功能损失，无需替代实现。
 - 在线更新已停用（macOS 更新器只会下载 mac 资产）；请到 GitHub Releases 手动更新。
-- 强制对齐的 qwen3-asr.cpp 加速运行时未提供 Windows 构建，识别走 Python 环境（qwen-asr），
-  速度略慢但结果一致。
+- 强制对齐加速：上游 qwen3-asr.cpp 无官方 Windows 构建，Windows 版用 MinGW-w64 自编译
+  （`dist` 的 Max 包已内置 qwen3-asr-cli 与对齐 GGUF）；轻量/Full 包识别走 Python 环境（qwen-asr），
+  结果一致、速度略慢。
 - 后台任务通过 cmd 批处理 + PowerShell 记录 PID，取消按钮用 taskkill 终止进程树。
 - 安装/卸载为 bat 脚本与 Inno Setup 安装器，对应 macOS 的 pkg 与卸载 command。
 

@@ -3,6 +3,7 @@
 from pathlib import Path
 import textwrap
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -117,7 +118,7 @@ def test_pipeline_extends_display_only_after_refinement_and_keeps_long_pauses(tm
     rows = [{"text": "前句", "start_frame": 15, "end_frame": 30, "speaker_track_index": 1},
             {"text": "后句", "start_frame": 45, "end_frame": 60, "speaker_track_index": 1}]
     namespace = dict(
-        subtitle_rows=rows, canonical_units=[], Path=Path, args=SimpleNamespace(fps=30.0, max_chars=20),
+        subtitle_rows=rows, canonical_units=[], Path=Path, Any=Any, args=SimpleNamespace(fps=30.0, max_chars=20),
         diagnostic={}, v5_mode=use_v5, v5_writeback="live",
         prepared_tracks=[{"track_index": 1, "audio_path": audio, "timeline_start_frame": 0, "fps": 30.0}],
         generate_v4=SimpleNamespace(

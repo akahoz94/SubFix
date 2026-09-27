@@ -17,10 +17,9 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ZIP = ROOT / "SubFix-v3.3.0-Windows.zip"
+ZIP = ROOT / "dist" / "SubFix-v3.3.0-Windows.zip"
 BAT_INSTALL = "安装_SubFix.bat"
 BAT_UNINSTALL = "卸载_SubFix.bat"
-SETUP_CMD = ".subfix_support/setup_asr_env.cmd"
 DEST = Path.home() / "AppData/Roaming/Blackmagic Design/DaVinci Resolve/Support/Fusion/Scripts/Utility"
 
 failures = []
@@ -64,22 +63,27 @@ def _chinese_ok(text, name):
 
 # ---------- 1. 仓库内静态审计 ----------
 print("== 1. 仓库内 bat/cmd 静态字节审计 ==")
-audit_batch(ROOT / BAT_INSTALL)
-audit_batch(ROOT / BAT_UNINSTALL)
-audit_batch(ROOT / SETUP_CMD)
+audit_batch(ROOT / "installer" / BAT_INSTALL)
+audit_batch(ROOT / "installer" / BAT_UNINSTALL)
+audit_batch(ROOT / ".subfix_support" / "setup_asr_env.cmd")
 
 # ---------- 2. zip 审计 ----------
 print("== 2. zip 中文名与字节一致性 ==")
 check("zip 存在", ZIP.exists())
 zf = zipfile.ZipFile(ZIP)
 names = zf.namelist()
-for entry in (BAT_INSTALL, BAT_UNINSTALL, "README.md", "SubFix/SubFix.lua", SETUP_CMD):
+# zip 条目 → 仓库源文件 映射（目录规整后安装器源码在 installer/，cmd 在 .subfix_support/）
+BAT_PAIRS = [
+    (BAT_INSTALL, ROOT / "installer" / BAT_INSTALL),
+    (BAT_UNINSTALL, ROOT / "installer" / BAT_UNINSTALL),
+    (".subfix_support/setup_asr_env.cmd", ROOT / ".subfix_support" / "setup_asr_env.cmd"),
+]
+for entry in (BAT_INSTALL, BAT_UNINSTALL, "README.md", "SubFix/SubFix.lua", ".subfix_support/setup_asr_env.cmd"):
     check(f"zip 条目名正确: {entry}", entry in names)
-for entry in (BAT_INSTALL, BAT_UNINSTALL, SETUP_CMD):
+for entry, disk in BAT_PAIRS:
     in_zip = zf.read(entry)
-    on_disk = (ROOT / entry).read_bytes()
-    check(f"zip 内 {entry} 与仓库逐字节一致", in_zip == on_disk,
-          f"zip={hashlib.sha256(in_zip).hexdigest()[:12]} disk={hashlib.sha256(on_disk).hexdigest()[:12]}")
+    check(f"zip 内 {entry} 与仓库逐字节一致", in_zip == disk.read_bytes(),
+          f"zip={hashlib.sha256(in_zip).hexdigest()[:12]} disk={hashlib.sha256(disk.read_bytes()).hexdigest()[:12]}")
 
 # ---------- 3. Expand-Archive 解压审计（与资源管理器同源实现） ----------
 print("== 3. Expand-Archive 解压（模拟资源管理器） ==")
@@ -90,11 +94,11 @@ r = subprocess.run(["powershell", "-NoProfile", "-Command",
                     f"Expand-Archive -LiteralPath '{ZIP}' -DestinationPath '{stage}' -Force"],
                    capture_output=True)
 check("Expand-Archive 解压成功", r.returncode == 0, r.stderr.decode("gbk", "replace")[:200])
-for entry in (BAT_INSTALL, BAT_UNINSTALL, SETUP_CMD):
+for entry, disk in BAT_PAIRS:
     extracted = stage / entry
     if extracted.exists():
         check(f"解压后 {entry} 哈希一致", hashlib.sha256(extracted.read_bytes()).hexdigest()
-              == hashlib.sha256((ROOT / entry).read_bytes()).hexdigest())
+              == hashlib.sha256(disk.read_bytes()).hexdigest())
     else:
         check(f"解压后存在 {entry}", False, str(list(stage.iterdir())))
 

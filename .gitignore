@@ -42,3 +42,7 @@ tests/fixtures/
 docs/superpowers/
 *.bak-*
 *.log
+
+# 构建产物与本地缓存
+dist/
+.build_cache/

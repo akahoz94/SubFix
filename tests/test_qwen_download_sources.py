@@ -1,5 +1,6 @@
 """Domestic downloads must not contact Hugging Face unless the primary fails."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -128,7 +129,8 @@ def test_incomplete_primary_download_triggers_fallback(tmp_path, monkeypatch):
 def test_installed_legacy_environment_is_not_migrated_or_redownloaded(tmp_path, monkeypatch):
     manager = load_manager_module()
     paths = make_paths(manager, tmp_path)
-    old_python = paths.legacy_env_dir / "bin" / "python"
+    legacy_rel = Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python"
+    old_python = paths.legacy_env_dir / legacy_rel
     old_python.parent.mkdir(parents=True)
     old_python.touch()
     paths.legacy_plugin_ready_marker.write_text("{}")

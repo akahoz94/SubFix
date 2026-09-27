@@ -37,7 +37,9 @@ SUPPORT_FILES = [
     "segmentation_profile_v4.json",
     "doubao_credentials.json.example",
 ]
-TOP_FILES = ["安装_SubFix.bat", "安装_SubFix_系统级.bat", "卸载_SubFix.bat", "接入本地模型.bat", "README.md"]
+# 安装器脚本源码在 installer/，打包时平铺到 zip 顶层（用户解压即见）
+INSTALLER_FILES = ["安装_SubFix.bat", "安装_SubFix_系统级.bat", "卸载_SubFix.bat", "接入本地模型.bat"]
+TOP_FILES = ["README.md"]
 
 # 内置运行时下载源（构建机缓存目录 .build_cache 可重用已下载文件）
 PYTHON_NUGET_URL = "https://www.nuget.org/api/v2/package/python/3.11.9"
@@ -70,6 +72,10 @@ def build_stage(version: str, bundle_runtime: bool, qwen_cpp: Path | None = None
     if missing:
         shutil.rmtree(stage, ignore_errors=True)
         raise SystemExit(f"打包失败：核心文件缺失 {missing}")
+    for name in INSTALLER_FILES:
+        src = ROOT / "installer" / name
+        if src.exists():
+            shutil.copy2(src, stage / name)
     for name in TOP_FILES:
         src = ROOT / name
         if src.exists():
@@ -77,7 +83,8 @@ def build_stage(version: str, bundle_runtime: bool, qwen_cpp: Path | None = None
 
     if bundle_runtime:
         cache = ROOT / ".build_cache"
-        cache.mkdir(exist_ok=True)        # 1) 内置 Python（nuget 包 = zip，tools/ 是完整便携 Python，支持 venv/pip）
+        cache.mkdir(exist_ok=True)
+        # 1) 内置 Python（nuget 包 = zip，tools/ 是完整便携 Python，支持 venv/pip）
         nupkg = cache / f"python.{PYTHON_NUGET_VERSION}.nupkg"
         if not nupkg.exists():
             print(f"下载内置 Python {PYTHON_NUGET_VERSION} ...")
@@ -161,6 +168,8 @@ def main() -> int:
         suffix = "-Full" if args.bundle_runtime else ""
         if args.qwen_cpp:
             suffix += "-Max"
+        dist_dir = ROOT / "dist"
+        dist_dir.mkdir(exist_ok=True)
         if args.installer:
             iss = ROOT / "scripts" / "windows" / "SubFix-setup.iss"
             cmd = ["ISCC.exe", f"/DVersion={args.version}", f"/DStageDir={stage}", str(iss)]
@@ -178,11 +187,11 @@ def main() -> int:
                 return 1
             # ISCC 以 iss 的 OutputDir/OutputBaseFilename 落盘，重命名为正式名
             staged_exe = stage / "SubFixSetup-stage.exe"
-            exe = ROOT / f"SubFix-v{args.version}-Windows-Setup.exe"
+            exe = dist_dir / f"SubFix-v{args.version}-Windows-Setup.exe"
             shutil.move(str(staged_exe), exe)
             print(f"已生成 {exe}")
         else:
-            zip_path = ROOT / f"SubFix-v{args.version}-Windows{suffix}.zip"
+            zip_path = dist_dir / f"SubFix-v{args.version}-Windows{suffix}.zip"
             if zip_path.exists():
                 zip_path.unlink()
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:

@@ -42,12 +42,15 @@ class EnvironmentLocationTests(unittest.TestCase):
         source = (ROOT / ".subfix_support/subfix_generate_selection_core.lua").read_text()
         for name in ["build_qwen_status_command", "build_qwen_install_command"]:
             body = source.split("local function " + name, 1)[1].split("\nend", 1)[0]
-            self.assertIn('"PYTHONDONTWRITEBYTECODE=1"', body)
+            # Windows 移植后统一用解释器 -B 标志抑制字节码写入（与 PYTHONDONTWRITEBYTECODE=1 等价）
             self.assertIn('"-B"', body)
 
     def test_real_local_pip_install_does_not_modify_script_tree(self):
-        self.paths.base_python.parent.mkdir(parents=True)
-        self.paths.base_python.symlink_to(sys.executable)
+        if os.name != "nt":
+            # macOS：base_python 指向 root/runtime 内解释器，需在隔离目录建软链指向真实解释器
+            self.paths.base_python.parent.mkdir(parents=True)
+            self.paths.base_python.symlink_to(sys.executable)
+        # Windows 轻量布局 base_python 回退当前解释器（sys.executable 已存在），无需软链
         before = {str(p.relative_to(self.paths.root)) for p in self.paths.root.rglob("*")}
         wheel = self.root / "subfix_path_probe-0.0.0-py3-none-any.whl"
         files = {f"subfix_path_probe/module_{i}.py": f"VALUE = {i}\n" for i in range(40)}
@@ -77,7 +80,8 @@ class EnvironmentLocationTests(unittest.TestCase):
 
     def test_completed_legacy_environment_still_works_without_mutation(self):
         self.make_model()
-        legacy_python = self.paths.root / "envs/qwen-local/bin/python"
+        legacy_rel = Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python"
+        legacy_python = self.paths.legacy_env_dir / legacy_rel
         legacy_python.parent.mkdir(parents=True)
         legacy_python.touch()
         marker = self.paths.root / ".subfix-qwen-local-ready.json"
