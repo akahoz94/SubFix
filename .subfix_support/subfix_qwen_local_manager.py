@@ -159,7 +159,31 @@ def huggingface_cache_roots() -> list[Path]:
     return list(dict.fromkeys(roots))
 
 
+def force_download_requested(paths: "SubFixQwenPaths") -> bool:
+    """用户在 UI 明确选择"重新下载模型"后由 Lua 写入的标记；存在时忽略一切本机模型候选。"""
+    return (paths.data_root / ".subfix-force-download").is_file()
+
+
+def env_model_dir() -> Path | None:
+    """SUBFIX_QWEN3_ASR_MODEL 指向的本机模型目录（接入本地模型.bat 或 setx 写入）。
+
+    本机模型优先级最高：用户明确登记的目录，命中即免下载。"""
+    value = str(os.getenv("SUBFIX_QWEN3_ASR_MODEL") or "").strip()
+    if not value:
+        return None
+    candidate = Path(value).expanduser()
+    if model_directory_is_complete(candidate):
+        return candidate
+    return None
+
+
 def existing_model_dir(paths: SubFixQwenPaths) -> Path | None:
+    if force_download_requested(paths):
+        # 重新下载模式：env/junction/HF 缓存一律忽略，只认数据目录里的完整模型
+        return paths.model_dir if model_directory_is_complete(paths.model_dir) else None
+    env_dir = env_model_dir()
+    if env_dir is not None:
+        return env_dir
     if model_directory_is_complete(paths.model_dir):
         return paths.model_dir
     if model_directory_is_complete(paths.legacy_model_dir):
@@ -179,6 +203,10 @@ def existing_model_dir(paths: SubFixQwenPaths) -> Path | None:
 
 
 def has_model_artifacts(paths: SubFixQwenPaths) -> bool:
+    if force_download_requested(paths):
+        return model_directory_is_complete(paths.model_dir)
+    if env_model_dir() is not None:
+        return True
     if paths.model_dir.is_dir() or paths.legacy_model_dir.is_dir():
         return True
     return any((root / "models--Qwen--Qwen3-ASR-1.7B" / "snapshots").is_dir() for root in huggingface_cache_roots())
@@ -580,6 +608,7 @@ def install(paths: SubFixQwenPaths, report: ProgressReporter) -> dict[str, objec
             paths.ready_marker.unlink(missing_ok=True)
             raise RuntimeError(f"下载模型失败：{exc}") from exc
     report("校验模型", "正在验证模型文件与运行环境")
+    (paths.data_root / ".subfix-force-download").unlink(missing_ok=True)
     write_ready_marker(paths, model_dir)
     status = inspect_install(paths)
     if not status.get("ready"):

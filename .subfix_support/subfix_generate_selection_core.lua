@@ -872,10 +872,15 @@ local function write_generate_preferences(data)
     data = type(data) == "table" and data or {}
     local last_engine_backend = trim_text(tostring(data.last_engine_backend or ""))
     local doubao_backend = normalize_doubao_backend(data.doubao_backend)
+    -- 本机模型登记（"使用本机模型"选项写入），随偏好持久化，避免每次生成都弹窗
+    local local_asr_model = trim_text(tostring(data.local_asr_model or ""))
+    local local_aligner_model = trim_text(tostring(data.local_aligner_model or ""))
     local content = string.format(
-        '{\n  "last_engine_backend": "%s",\n  "doubao_backend": "%s"\n}\n',
+        '{\n  "last_engine_backend": "%s",\n  "doubao_backend": "%s",\n  "local_asr_model": "%s",\n  "local_aligner_model": "%s"\n}\n',
         json_escape(last_engine_backend),
-        json_escape(doubao_backend)
+        json_escape(doubao_backend),
+        json_escape(local_asr_model),
+        json_escape(local_aligner_model)
     )
     return write_text_file(generate_prefs_file_path(), content)
 end
@@ -3454,6 +3459,142 @@ local function build_asr_helper_command(audio_source, srt_path, json_path, timel
     return table.concat(cmd_parts, " "), nil
 end
 
+-- ========== 本机已有模型探测（免重复下载） ==========
+-- 候选顺序：环境变量（接入本地模型.bat / setx 写入）→ junction 数据目录 → 发行默认库 G:\AImodel。
+local function local_model_dir_complete(dir)
+    if type(dir) ~= "string" or dir == "" then return false end
+    if not file_exists(dir .. "/config.json") then return false end
+    return file_exists(dir .. "/model.safetensors.index.json") or file_exists(dir .. "/model.safetensors")
+end
+
+local function probe_local_model_candidates()
+    local found = { asr = nil, aligner = nil }
+    local asr_candidates, aligner_candidates = {}, {}
+    local function push(list, value)
+        value = trim_text(tostring(value or ""))
+        if value ~= "" then list[#list + 1] = value end
+    end
+    push(asr_candidates, os.getenv("SUBFIX_QWEN3_ASR_MODEL"))
+    push(aligner_candidates, os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL"))
+    local home_dir = subfix_home_dir()
+    if SUBFIX_IS_WINDOWS then
+        push(asr_candidates, home_dir .. "/AppData/Roaming/SubFix/models/qwen3-asr-1.7b")
+    else
+        push(asr_candidates, home_dir .. "/Library/Application Support/SubFix/models/qwen3-asr-1.7b")
+    end
+    push(asr_candidates, "G:/AImodel/Qwen3-ASR-1.7B")
+    push(aligner_candidates, "G:/AImodel/Qwen3-ForcedAligner-0.6B")
+    for _, dir in ipairs(asr_candidates) do
+        if local_model_dir_complete(dir) then found.asr = dir break end
+    end
+    for _, dir in ipairs(aligner_candidates) do
+        if local_model_dir_complete(dir) then found.aligner = dir break end
+    end
+    return found
+end
+
+local function ensure_local_model_junction(source_dir)
+    if not SUBFIX_IS_WINDOWS then return false end
+    local home_dir = subfix_home_dir()
+    local dest = home_dir .. "/AppData/Roaming/SubFix/models/qwen3-asr-1.7b"
+    if local_model_dir_complete(dest) then return true end
+    subfix_ensure_dir(home_dir .. "/AppData/Roaming/SubFix/models")
+    -- ponytail: mklink 走 cmd，路径含中文（用户名/模型目录）时会因 ANSI 转码失败；
+    -- 失败不影响主流程——生成时的 env_pairs 仍会把本机路径传给识别进程。
+    os.execute('mklink /J "' .. subfix_cmd_path(dest) .. '" "' .. subfix_cmd_path(source_dir) .. '" >nul 2>&1')
+    return local_model_dir_complete(dest)
+end
+
+-- 用户明确选择重新下载：写 force 标记（管理器将忽略本机候选重新下载）、摘 junction、清偏好。
+local function request_local_model_redownload()
+    local home_dir = subfix_home_dir()
+    local data_root
+    if SUBFIX_IS_WINDOWS then
+        data_root = home_dir .. "/AppData/Roaming/SubFix"
+    else
+        data_root = home_dir .. "/Library/Application Support/SubFix"
+    end
+    write_text_file(data_root .. "/.subfix-force-download", "1")
+    local junction = data_root .. "/models/qwen3-asr-1.7b"
+    if SUBFIX_IS_WINDOWS then
+        -- rmdir 对 junction 只删链接本身，不碰目标模型
+        os.execute('rmdir "' .. subfix_cmd_path(junction) .. '" >nul 2>&1')
+    end
+    local data = read_generate_preferences()
+    data.local_asr_model = ""
+    data.local_aligner_model = ""
+    write_generate_preferences(data)
+end
+
+-- 状态缺失时探测本机模型，弹"使用本机模型 / 联网下载"选项；返回是否已登记本机模型。
+-- 偏好里已登记过的直接静默通过，不再弹窗。
+local function offer_local_model_option()
+    local saved = read_generate_preferences()
+    if local_model_dir_complete(trim_text(tostring(saved.local_asr_model or ""))) then
+        ensure_local_model_junction(trim_text(tostring(saved.local_asr_model)))
+        return "local"
+    end
+    local found = probe_local_model_candidates()
+    if not (found.asr or found.aligner) then return false end
+    if not (dispatcher and ui) then
+        -- 无 UI 环境：直接采用本机模型并记入偏好
+        local data = read_generate_preferences()
+        if found.asr then data.local_asr_model = found.asr end
+        if found.aligner then data.local_aligner_model = found.aligner end
+        write_generate_preferences(data)
+        ensure_local_model_junction(found.asr or "")
+        return "local"
+    end
+    local detail_lines = {}
+    if found.asr then detail_lines[#detail_lines + 1] = "识别模型：" .. found.asr end
+    if found.aligner then detail_lines[#detail_lines + 1] = "对齐模型：" .. found.aligner end
+    local action = "download"
+    local window = dispatcher:AddWindow({
+        ID = "GenerateQwenLocalModelWindow",
+        WindowTitle = "SubFix · 检测到本机模型",
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 340, 520, 170}),
+    },
+    ui:VGroup{
+        Spacing = 8,
+        ContentsMargins = 14,
+        ui:Label{Text = "检测到本机已有 Qwen 模型，无需重复下载：", Weight = 0},
+        ui:Label{Text = table.concat(detail_lines, "\n"), Weight = 0},
+        ui:HGroup{
+            Weight = 0,
+            MinimumSize = {0, 34},
+            ui:Button{ID = "GenerateQwenLocalUseBtn", Text = "使用本机模型", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "GenerateQwenLocalRedownloadBtn", Text = "重新下载（联网）", Weight = 1, MinimumSize = {0, 28}}
+        }
+    })
+    function window.On.GenerateQwenLocalUseBtn.Clicked(ev) action = "local" window:Hide() dispatcher:ExitLoop() end
+    function window.On.GenerateQwenLocalRedownloadBtn.Clicked(ev) action = "redownload" window:Hide() dispatcher:ExitLoop() end
+    function window.On.GenerateQwenLocalModelWindow.Close(ev) action = "dismiss" window:Hide() dispatcher:ExitLoop() end
+    window:Show()
+    dispatcher:RunLoop()
+    pcall(function() window:Hide() end)
+    if action == "redownload" then
+        request_local_model_redownload()
+        return "redownload"
+    end
+    if action ~= "local" then return "dismiss" end
+    local data = read_generate_preferences()
+    if found.asr then data.local_asr_model = found.asr end
+    if found.aligner then data.local_aligner_model = found.aligner end
+    write_generate_preferences(data)
+    ensure_local_model_junction(found.asr or "")
+    return "local"
+end
+
+local function resolve_local_aligner_model()
+    local value = trim_text(tostring(os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or ""))
+    if value ~= "" then return value end
+    local data = read_generate_preferences()
+    value = trim_text(tostring(data.local_aligner_model or ""))
+    if value ~= "" then return value end
+    local probe = probe_local_model_candidates()
+    return tostring(probe.aligner or "")
+end
+
 local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend, hotwords_json)
     local paths = resolve_asr_paths()
     if not file_exists(paths.helper) then
@@ -3475,7 +3616,20 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
             end
         end
     elseif not (qwen_status and qwen_status.ready and file_exists(qwen_status.python or "")) then
-        return nil, "本地 Qwen 尚未安装，请先双击“Qwen（本地）”完成下载安装"
+        -- 不再直接逼下载：先探测本机已有模型，给用户"使用本机模型"选项
+        local chosen_local = offer_local_model_option()
+        if chosen_local == "local" then
+            qwen_status = inspect_local_qwen(paths)
+        end
+        if not (qwen_status and qwen_status.ready and file_exists(qwen_status.python or "")) then
+            if chosen_local == "local" then
+                return nil, "本机模型已登记，但识别依赖尚未安装：请点击“Qwen（本地）”完成依赖安装（不会重复下载模型）"
+            end
+            if chosen_local == "redownload" then
+                return nil, "已选择重新下载模型：请点击“Qwen（本地）”开始（将重新下载约 1.7 GB 模型）"
+            end
+            return nil, "本地 Qwen 尚未安装，请先双击“Qwen（本地）”完成下载安装"
+        end
     else
         python = qwen_status.python
     end
@@ -3483,11 +3637,26 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     local cmd_parts = {}
     local env_pairs = {}
     if asr_backend == "auto" then
-        if SUBFIX_IS_WINDOWS then
-            -- cmd.exe 不支持 VAR=value 前缀，改由后台批处理 set 后再启动
-            env_pairs[#env_pairs + 1] = { name = "SUBFIX_QWEN3_ASR_MODEL", value = tostring(qwen_status.model or "") }
-        else
-            cmd_parts[#cmd_parts + 1] = "SUBFIX_QWEN3_ASR_MODEL=" .. shell_quote(qwen_status.model)
+        local asr_model_value = tostring(qwen_status.model or "")
+        if trim_text(asr_model_value) == "" then
+            -- 状态未就绪但用户已登记本机模型（junction 创建失败等场景）：仍走本机路径
+            local prefs = read_generate_preferences()
+            asr_model_value = trim_text(tostring(prefs.local_asr_model or ""))
+        end
+        if trim_text(asr_model_value) ~= "" then
+            if SUBFIX_IS_WINDOWS then
+                -- cmd.exe 不支持 VAR=value 前缀，改由后台批处理 set 后再启动
+                env_pairs[#env_pairs + 1] = { name = "SUBFIX_QWEN3_ASR_MODEL", value = asr_model_value }
+            else
+                cmd_parts[#cmd_parts + 1] = "SUBFIX_QWEN3_ASR_MODEL=" .. shell_quote(asr_model_value)
+            end
+        end
+    end
+    if SUBFIX_IS_WINDOWS then
+        -- Python 端强制对齐同样免下载：把本机对齐模型传给识别进程（豆包后端也需要）
+        local aligner_model_value = resolve_local_aligner_model()
+        if trim_text(aligner_model_value) ~= "" then
+            env_pairs[#env_pairs + 1] = { name = "SUBFIX_QWEN3_ALIGNER_MODEL", value = aligner_model_value }
         end
     end
     local command_args = {}
