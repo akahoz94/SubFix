@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Manage the optional local Qwen ASR extension shipped beside SubFix."""
 
 from __future__ import annotations
@@ -435,7 +435,7 @@ def install_torch_with_cuda(env_python: Path, report: ProgressReporter, log_path
                "--extra-index-url", PYPI_INDEX_FALLBACKS[0],
                "--timeout", "60", "--retries", "5", "--disable-pip-version-check",
                "--no-input", "--progress-bar", "off",
-               "--force-reinstall", "--no-deps", "torch"]
+               "--force-reinstall", "--no-deps", "--no-cache-dir", "torch"]
     try:
         run_checked(command, error_prefix="安装 GPU 版 PyTorch 失败",
                     log_path=log_path, report=report,
