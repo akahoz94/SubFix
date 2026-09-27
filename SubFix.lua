@@ -9497,8 +9497,14 @@ function SUBFIX_AUDIO_ALIGN.qwen3_cpp_available(paths)
     if helper_dir == "" then
         return false
     end
-    local legacy_cli = helper_dir .. "/qwen3-asr.cpp/build/qwen3-asr-cli"
-    local packaged_cli = helper_dir .. "/bin/qwen3-asr-cli"
+    local cli_names = SUBFIX_IS_WINDOWS and {"qwen3-asr-cli.exe", "qwen3-asr-cli"} or {"qwen3-asr-cli"}
+    local legacy_cli, packaged_cli
+    for _, cli_name in ipairs(cli_names) do
+        local a = helper_dir .. "/qwen3-asr.cpp/build/" .. cli_name
+        local b = helper_dir .. "/bin/" .. cli_name
+        if not legacy_cli and SUBFIX_AUDIO_ALIGN.file_exists(a) then legacy_cli = a end
+        if not packaged_cli and SUBFIX_AUDIO_ALIGN.file_exists(b) then packaged_cli = b end
+    end
     if not SUBFIX_AUDIO_ALIGN.file_exists(legacy_cli) and not SUBFIX_AUDIO_ALIGN.file_exists(packaged_cli) then
         return false
     end

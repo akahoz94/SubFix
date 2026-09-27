@@ -6489,13 +6489,13 @@ def qwen3_support_roots() -> list[Path]:
 
 
 def discover_qwen3_cpp_bin() -> Path | None:
+    cli_names = ("qwen3-asr-cli.exe", "qwen3-asr-cli") if os.name == "nt" else ("qwen3-asr-cli",)
     for root in qwen3_support_roots():
-        for candidate in (
-            root / "qwen3-asr.cpp" / "build" / "qwen3-asr-cli",
-            root / "bin" / "qwen3-asr-cli",
-        ):
-            if candidate.exists() and os.access(candidate, os.X_OK):
-                return candidate
+        for sub_dir in ("qwen3-asr.cpp/build", "bin"):
+            for name in cli_names:
+                candidate = root / sub_dir.replace("/", os.sep) / name
+                if candidate.exists() and os.access(candidate, os.X_OK):
+                    return candidate
     resolved_bin = shutil.which("qwen3-asr-cli")
     return Path(resolved_bin) if resolved_bin else None
 
