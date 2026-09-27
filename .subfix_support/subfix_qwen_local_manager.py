@@ -417,11 +417,11 @@ def install_qwen_dependencies(env_python: Path, report: ProgressReporter, log_pa
         heartbeat=("准备下载工具", "正在升级 pip，启用下载中断恢复"),
     )
     pip_install_with_index_fallback(
-        env_python, ["qwen-asr", "torch", "huggingface_hub", "modelscope"],
+        env_python, ["qwen-asr", "torch", "huggingface_hub", "modelscope", "onnxruntime"],
         error_prefix="安装本地 Qwen 依赖失败",
         report=report,
         log_path=log_path,
-        heartbeat=("安装依赖", "正在安装 qwen-asr 与 PyTorch，下载中断会自动重试，请保持网络连接"),
+        heartbeat=("安装依赖", "正在安装识别引擎依赖（qwen-asr 与 PyTorch，非模型文件），下载中断会自动重试，请保持网络连接"),
         extra_args=["--resume-retries", "5"],
     )
 
@@ -538,7 +538,7 @@ def report_model_download_progress(
             if eta_seconds is not None:
                 details["eta_seconds"] = eta_seconds
         if details:
-            report("下载模型", "正在下载 Qwen3-ASR-1.7B", **details)
+            report("下载模型", "正在下载 Qwen3-ASR-1.7B 模型（约 1.7GB）", **details)
         else:
             report("连接模型仓库", "正在连接 Qwen3-ASR-1.7B")
         stop_event.wait(1)
@@ -624,7 +624,7 @@ def install(paths: SubFixQwenPaths, report: ProgressReporter) -> dict[str, objec
     report("创建环境", "正在准备本地 Qwen 运行环境")
     create_or_reuse_venv(paths.base_python, paths.env_dir)
     if not python_can_import_qwen_asr(paths.env_python):
-        report("安装依赖", "正在安装 qwen-asr 与 PyTorch")
+        report("安装依赖", "正在安装识别引擎依赖（qwen-asr 与 PyTorch，非模型文件）")
         install_qwen_dependencies(paths.env_python, report, paths.install_log)
     else:
         report("检查依赖", "本地 Qwen 运行环境已就绪")
@@ -634,7 +634,7 @@ def install(paths: SubFixQwenPaths, report: ProgressReporter) -> dict[str, objec
     else:
         try:
             ensure_model_dir_writable(paths.model_dir)
-            report("下载模型", "正在下载 Qwen3-ASR-1.7B")
+            report("下载模型", "正在下载 Qwen3-ASR-1.7B 模型（约 1.7GB）")
             download_model(paths.env_python, paths.model_dir, report, paths.install_log)
             model_dir = paths.model_dir
         except Exception as exc:

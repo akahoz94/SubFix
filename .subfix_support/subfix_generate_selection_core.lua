@@ -60,6 +60,8 @@ if SUBFIX_IS_WINDOWS then
             int WriteFile(void *hFile, const char *lpBuffer, unsigned long nNumberOfBytesToWrite, unsigned long *lpNumberOfBytesWritten, void *lpOverlapped);
             int CloseHandle(void *hObject);
             int CreateProcessW(const wchar_t *lpApplicationName, wchar_t *lpCommandLine, void *lpProcessAttributes, void *lpThreadAttributes, int bInheritHandles, unsigned long dwCreationFlags, void *lpEnvironment, const wchar_t *lpCurrentDirectory, void *lpStartupInfo, void *lpProcessInformation);
+            int WaitForSingleObject(void *hHandle, unsigned long dwMilliseconds);
+            int GetExitCodeProcess(void *hProcess, unsigned long *lpExitCode);
             typedef struct { DWORD cb; wchar_t *lpReserved; wchar_t *lpDesktop; wchar_t *lpTitle; DWORD dwX; DWORD dwY; DWORD dwXSize; DWORD dwYSize; DWORD dwXCountChars; DWORD dwYCountChars; DWORD dwFillAttribute; DWORD dwFlags; unsigned short wShowWindow; unsigned short cbReserved2; unsigned char *lpReserved2; void *hStdInput; void *hStdOutput; void *hStdError; } STARTUPINFOW;
             typedef struct { void *hProcess; void *hThread; DWORD dwProcessId; DWORD dwThreadId; } PROCESS_INFORMATION;
         ]]
@@ -166,6 +168,42 @@ if SUBFIX_IS_WINDOWS then
             SUBFIX_FFI.C.CloseHandle(pi.hThread)
             return pid
         end
+
+        -- 隐藏执行并等待结束，返回退出码（Windows 版 os.execute，无黑色 cmd 窗口）。
+        -- 语义与 os.execute 一致（同步等待；重定向由调用方提供）；FFI 不可用时回退 os.execute。
+        -- 实现：把命令写入临时 .bat 再 cmd /c 执行——命令在 bat 内原样运行，
+        -- 彻底规避 cmd 直接解析命令时的引号剥离/转义问题；chcp 65001 保证 UTF-8 中文路径。
+        -- 用途：status 查询 / junction / taskkill 等不希望在 Resolve 里闪黑框的操作。
+        function subfix_execute_hidden(utf8_command)
+            local bat_path = subfix_temp_root() .. "/subfix_exec_" .. tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999)) .. ".bat"
+            local content = "chcp 65001 >nul\r\n" .. tostring(utf8_command) .. "\r\n"
+            if not subfix_write_file_w(bat_path, content) then
+                return os.execute(utf8_command)
+            end
+            local wcmd = subfix_utf8_to_wide('cmd.exe /c "' .. bat_path .. '"')
+            if not wcmd then
+                subfix_remove_files(bat_path)
+                return os.execute(utf8_command)
+            end
+            local si = SUBFIX_FFI.new("STARTUPINFOW")
+            si.cb = SUBFIX_FFI.sizeof(si)
+            local pi = SUBFIX_FFI.new("PROCESS_INFORMATION")
+            -- CREATE_NO_WINDOW = 0x08000000
+            local ok = SUBFIX_FFI.C.CreateProcessW(nil, wcmd, nil, nil, 0, 0x08000000, nil, nil, si, pi)
+            if ok == 0 then
+                subfix_remove_files(bat_path)
+                return os.execute(utf8_command)
+            end
+            -- INFINITE = 0xFFFFFFFF：同步等待进程结束（与 os.execute 一致）
+            SUBFIX_FFI.C.WaitForSingleObject(pi.hProcess, 0xFFFFFFFF)
+            local exit_code = SUBFIX_FFI.new("unsigned long[1]")
+            SUBFIX_FFI.C.GetExitCodeProcess(pi.hProcess, exit_code)
+            local code = tonumber(exit_code[0])
+            SUBFIX_FFI.C.CloseHandle(pi.hProcess)
+            SUBFIX_FFI.C.CloseHandle(pi.hThread)
+            subfix_remove_files(bat_path)
+            return code
+        end
     end
 end
 
@@ -241,7 +279,7 @@ function subfix_kill_tree(pid)
     pid = tonumber(pid)
     if not pid or pid <= 0 then return end
     if SUBFIX_IS_WINDOWS then
-        os.execute(string.format("taskkill /PID %d /T /F >nul 2>&1", pid))
+        subfix_execute_hidden(string.format("taskkill /PID %d /T /F >nul 2>&1", pid))
     else
         os.execute(string.format("pkill -P %d 2>/dev/null; kill -9 %d 2>/dev/null", pid, pid))
     end
@@ -770,7 +808,7 @@ local function inspect_local_qwen(paths)
     local cmd = build_qwen_status_command(paths, output_path)
     if not cmd then return {state = "missing", ready = false} end
     if SUBFIX_IS_WINDOWS then
-        os.execute(cmd .. " >nul 2>&1")
+        subfix_execute_hidden(cmd .. " >nul 2>&1")
     else
         os.execute(cmd .. " >/dev/null 2>&1")
     end
@@ -3507,7 +3545,7 @@ local function ensure_local_model_junction(source_dir)
     subfix_ensure_dir(home_dir .. "/AppData/Roaming/SubFix/models")
     -- ponytail: mklink 走 cmd，路径含中文（用户名/模型目录）时会因 ANSI 转码失败；
     -- 失败不影响主流程——生成时的 env_pairs 仍会把本机路径传给识别进程。
-    os.execute('mklink /J "' .. subfix_cmd_path(dest) .. '" "' .. subfix_cmd_path(source_dir) .. '" >nul 2>&1')
+    subfix_execute_hidden('mklink /J "' .. subfix_cmd_path(dest) .. '" "' .. subfix_cmd_path(source_dir) .. '" >nul 2>&1')
     return local_model_dir_complete(dest)
 end
 
@@ -3524,7 +3562,7 @@ local function request_local_model_redownload()
     local junction = data_root .. "/models/qwen3-asr-1.7b"
     if SUBFIX_IS_WINDOWS then
         -- rmdir 对 junction 只删链接本身，不碰目标模型
-        os.execute('rmdir "' .. subfix_cmd_path(junction) .. '" >nul 2>&1')
+        subfix_execute_hidden('rmdir "' .. subfix_cmd_path(junction) .. '" >nul 2>&1')
     end
     local data = read_generate_preferences()
     data.local_asr_model = ""

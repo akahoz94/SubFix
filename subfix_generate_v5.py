@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import importlib.util
 import math
+import os
 import re
 import wave
 from array import array
@@ -20,6 +21,19 @@ except ModuleNotFoundError as exc:
         raise RuntimeError("v4 生成模块无法加载")
     v4 = importlib.util.module_from_spec(_v4_spec)
     _v4_spec.loader.exec_module(v4)
+
+try:
+    import subfix_silero_vad as silero_vad
+except ModuleNotFoundError as exc:
+    if exc.name != "subfix_silero_vad":
+        raise
+    _silero_path = Path(__file__).resolve().with_name("subfix_silero_vad.py")
+    _silero_spec = importlib.util.spec_from_file_location("subfix_silero_vad", _silero_path)
+    if _silero_spec is None or _silero_spec.loader is None:
+        silero_vad = None
+    else:
+        silero_vad = importlib.util.module_from_spec(_silero_spec)
+        _silero_spec.loader.exec_module(silero_vad)
 
 
 PROFILE_SCHEMA = "subfix_segmentation_profile_v4"
@@ -485,6 +499,27 @@ def _window_rms(samples: array, size: int) -> list[float]:
     return levels
 
 
+def _speech_regions_silero(
+    samples: array, sample_rate: int, fps: float, track_start_frame: int
+) -> tuple[list[tuple[int, int]] | None, str]:
+    """Silero 语音区转时间轴帧。None 表示未运行（回退能量法），[] 表示确无语音。"""
+    if silero_vad is None or os.environ.get("SUBFIX_DISABLE_SILERO"):
+        return None, "rms"
+    try:
+        intervals = silero_vad.detect_speech_intervals(samples, sample_rate)
+    except Exception:
+        return None, "silero_failed"
+    regions = [
+        (
+            track_start_frame + int(round(start * fps)),
+            max(track_start_frame + 1, track_start_frame + int(round(end * fps))),
+        )
+        for start, end in intervals
+        if end > start
+    ]
+    return regions, "silero"
+
+
 def _speech_regions(levels: list[float], sample_rate: int, hop_samples: int, fps: float, track_start_frame: int) -> list[tuple[int, int]]:
     if not levels:
         return []
@@ -562,7 +597,11 @@ def refine_subtitle_boundaries(
     sample_rate, samples = _read_pcm16(audio_path)
     hop_samples = max(1, int(round(sample_rate * 0.01)))
     levels = _window_rms(samples, hop_samples)
-    regions = _speech_regions(levels, sample_rate, hop_samples, fps, track_start_frame)
+    silero_regions, detector = _speech_regions_silero(samples, sample_rate, fps, track_start_frame)
+    if silero_regions is None:
+        regions = _speech_regions(levels, sample_rate, hop_samples, fps, track_start_frame)
+    else:
+        regions = silero_regions
     search_frames = max(1, int(round(12)))
     output: list[dict[str, Any]] = []
     for raw_row in sorted(rows or [], key=lambda row: (int(row.get("start_frame") or 0), int(row.get("end_frame") or 0))):
@@ -616,6 +655,7 @@ def refine_subtitle_boundaries(
             right["start_frame"] = right_start
             preserved_gaps += 1
     return output, {
+        "speech_detector": detector,
         "audio_refined_row_count": sum(row["start_frame"] != row["original_start_frame"] or row["end_frame"] != row["original_end_frame"] for row in output),
         "audio_refinement_shrink_rejected_count": 0,
         "energy_valley_boundary_count": valley_count,

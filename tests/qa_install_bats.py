@@ -17,7 +17,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ZIP = ROOT / "dist" / "SubFix-v3.3.0-Windows.zip"
+ZIP = ROOT / "dist" / "SubFix-v3.4.0-Windows.zip"
 BAT_INSTALL = "安装_SubFix.bat"
 BAT_UNINSTALL = "卸载_SubFix.bat"
 DEST = Path.home() / "AppData/Roaming/Blackmagic Design/DaVinci Resolve/Support/Fusion/Scripts/Utility"

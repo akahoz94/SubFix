@@ -25,6 +25,7 @@ ROOT_PY = [
     "subfix_generate_v4.py",
     "subfix_generate_v5.py",
     "subfix_generate_textnorm.py",
+    "subfix_silero_vad.py",
 ]
 SUPPORT_FILES = [
     "subfix_generate_selection_core.lua",
@@ -72,6 +73,13 @@ def build_stage(version: str, bundle_runtime: bool, qwen_cpp: Path | None = None
     if missing:
         shutil.rmtree(stage, ignore_errors=True)
         raise SystemExit(f"打包失败：核心文件缺失 {missing}")
+    # Silero VAD 小模型（约 2.3MB）随所有形态分发；缺失只降级到 RMS 能量法，不阻断打包
+    vad_model = ROOT / ".subfix_support" / "models" / "silero_vad.onnx"
+    if vad_model.exists():
+        (support_dir / "models").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(vad_model, support_dir / "models" / vad_model.name)
+    else:
+        print("警告：缺少 .subfix_support/models/silero_vad.onnx，本包 VAD 回退 RMS 能量法")
     for name in INSTALLER_FILES:
         src = ROOT / "installer" / name
         if src.exists():

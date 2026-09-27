@@ -15,7 +15,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ZIP = ROOT / "dist" / "SubFix-v3.3.0-Windows.zip"
+ZIP = ROOT / "dist" / "SubFix-v3.4.0-Windows.zip"
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from lupa.luajit21 import LuaRuntime  # noqa: E402
