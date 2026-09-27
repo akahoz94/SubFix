@@ -3,6 +3,27 @@
 DaVinci Resolve 字幕插件的 Windows 移植版，基于上游 macOS v3.3.0（HooperH/SubFix）。
 口播、现场、单段和批量字幕生成统一使用 v5 引擎，功能与 macOS 版一致。
 
+## 发行形态
+
+| 包 | 内容 | 适用 |
+|---|---|---|
+| `SubFix-v*-Windows.zip` | 插件本体，依赖系统 Python/ffmpeg | 已装 Python 的机器 |
+| `SubFix-v*-Windows-Full.zip` | 内置 Python 3.11 运行时与 ffmpeg（含 DLL） | 免装依赖 |
+| `SubFix-v*-Windows-Max.zip` | Full + 自编译 qwen3-asr-cli 加速对齐（GGUF 模型） | 全离线 |
+| `SubFix-v*-Windows-Setup.exe` | Inno Setup 安装器（简体中文向导，可静默 `/VERYSILENT`） | 常规安装 |
+
+构建命令（`.build_cache` 缓存下载物）：
+
+```
+python build_windows_zip.py                       # 轻量
+python build_windows_zip.py --bundle-runtime      # Full
+python build_windows_zip.py --bundle-runtime --qwen-cpp <组装片段目录>   # Max
+python build_windows_zip.py --installer           # Setup.exe
+```
+
+qwen3-asr.cpp Windows 构建流程见 `scripts/windows/`（MinGW-w64 + CMake+Ninja；
+对齐模型用 `scripts/convert_hf_to_gguf.py` 从本地 transformers 模型转换，无需联网）。
+
 ## 系统要求
 
 - Windows 10/11 x64

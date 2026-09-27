@@ -49,7 +49,7 @@ FFMPEG_URLS = (
 )
 
 
-def build_stage(version: str, bundle_runtime: bool) -> tuple[Path, list[str]]:
+def build_stage(version: str, bundle_runtime: bool, qwen_cpp: Path | None = None) -> tuple[Path, list[str]]:
     stage = Path(tempfile.mkdtemp(prefix="subfix-win-stage-"))
     notes = []
 
@@ -77,8 +77,7 @@ def build_stage(version: str, bundle_runtime: bool) -> tuple[Path, list[str]]:
 
     if bundle_runtime:
         cache = ROOT / ".build_cache"
-        cache.mkdir(exist_ok=True)
-        # 1) 内置 Python（nuget 包 = zip，tools/ 是完整便携 Python，支持 venv/pip）
+        cache.mkdir(exist_ok=True)        # 1) 内置 Python（nuget 包 = zip，tools/ 是完整便携 Python，支持 venv/pip）
         nupkg = cache / f"python.{PYTHON_NUGET_VERSION}.nupkg"
         if not nupkg.exists():
             print(f"下载内置 Python {PYTHON_NUGET_VERSION} ...")
@@ -127,6 +126,21 @@ def build_stage(version: str, bundle_runtime: bool) -> tuple[Path, list[str]]:
             raise SystemExit("内置 ffmpeg 解压失败：bin/ffmpeg.exe 不存在")
         dll_count = len(list(bin_dir.glob("*.dll")))
         notes.append(f"内置 ffmpeg（{dll_count} 个 DLL）")
+
+    if qwen_cpp is not None:
+        # qwen_cpp 指向已用 scripts/windows/stage_qwen3_cpp.py 组装好的 .subfix_support 片段
+        src_bin = qwen_cpp / "bin"
+        cli = src_bin / "qwen3-asr-cli.exe"
+        if not cli.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+            raise SystemExit(f"--qwen-cpp 缺少 {cli}；先运行 scripts/windows/stage_qwen3_cpp.py")
+        support_out = stage / ".subfix_support"
+        shutil.copytree(src_bin, support_out / "bin", dirs_exist_ok=True)
+        dll_count = len(list((support_out / "bin").glob("*.dll")))
+        ggufs = sorted((qwen_cpp / "models").glob("*.gguf")) if (qwen_cpp / "models").exists() else []
+        for gguf in ggufs:
+            shutil.copy2(gguf, support_out / "models" / gguf.name)
+        notes.append(f"qwen3-asr-cli（{dll_count} DLL）" + (f" + 对齐模型 {ggufs[0].name}" if ggufs else ""))
     return stage, notes
 
 
@@ -137,11 +151,15 @@ def main() -> int:
                         help="内置 Python 运行时与 ffmpeg（Full 包）")
     parser.add_argument("--installer", action="store_true",
                         help="用 Inno Setup 生成 Setup.exe（需要 ISCC.exe）")
+    parser.add_argument("--qwen-cpp", type=Path, default=None,
+                        help="qwen3-asr.cpp 组装片段目录（bin/+models/），打入包内")
     args = parser.parse_args()
 
-    stage, notes = build_stage(args.version, args.bundle_runtime)
+    stage, notes = build_stage(args.version, args.bundle_runtime, args.qwen_cpp)
     try:
         suffix = "-Full" if args.bundle_runtime else ""
+        if args.qwen_cpp:
+            suffix += "-Max"
         if args.installer:
             iss = ROOT / "scripts" / "windows" / "SubFix-setup.iss"
             cmd = ["ISCC.exe", f"/DVersion={args.version}", f"/DStageDir={stage}", str(iss)]
