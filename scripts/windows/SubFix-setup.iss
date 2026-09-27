@@ -31,8 +31,8 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 [Files]
 Source: "{#StageDir}\SubFix\*"; DestDir: "{app}\SubFix"; Flags: recursesubdirs ignoreversion
 Source: "{#StageDir}\.subfix_support\*"; DestDir: "{app}\.subfix_support"; Flags: recursesubdirs ignoreversion
-Source: "{#StageDir}\README-win.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\接入本地模型.bat"; DestDir: "{app}"; Flags: ignoreversion
 
 [Run]
-Filename: "{app}\README-win.md"; Description: "查看说明（README-win.md）"; Flags: postinstall shellexec skipifsilent unchecked
+Filename: "{app}\README.md"; Description: "查看说明（README.md）"; Flags: postinstall shellexec skipifsilent unchecked

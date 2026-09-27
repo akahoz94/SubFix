@@ -73,7 +73,7 @@ print("== 2. zip 中文名与字节一致性 ==")
 check("zip 存在", ZIP.exists())
 zf = zipfile.ZipFile(ZIP)
 names = zf.namelist()
-for entry in (BAT_INSTALL, BAT_UNINSTALL, "README-win.md", "SubFix/SubFix.lua", SETUP_CMD):
+for entry in (BAT_INSTALL, BAT_UNINSTALL, "README.md", "SubFix/SubFix.lua", SETUP_CMD):
     check(f"zip 条目名正确: {entry}", entry in names)
 for entry in (BAT_INSTALL, BAT_UNINSTALL, SETUP_CMD):
     in_zip = zf.read(entry)

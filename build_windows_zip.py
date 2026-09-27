@@ -37,7 +37,7 @@ SUPPORT_FILES = [
     "segmentation_profile_v4.json",
     "doubao_credentials.json.example",
 ]
-TOP_FILES = ["安装_SubFix.bat", "安装_SubFix_系统级.bat", "卸载_SubFix.bat", "接入本地模型.bat", "README-win.md"]
+TOP_FILES = ["安装_SubFix.bat", "安装_SubFix_系统级.bat", "卸载_SubFix.bat", "接入本地模型.bat", "README.md"]
 
 # 内置运行时下载源（构建机缓存目录 .build_cache 可重用已下载文件）
 PYTHON_NUGET_URL = "https://www.nuget.org/api/v2/package/python/3.11.9"
