@@ -24,6 +24,118 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
+-- ========== Windows 兼容层 ==========
+-- Resolve 在 Windows 上通过 cmd.exe 执行 os.execute/io.popen，
+-- 这里集中处理平台判断、shell 引用、临时目录、目录创建、进程树终止与后台启动。
+-- 使用全局命名空间以避开主 chunk 的 Lua 5.1 local 槽位上限。
+SUBFIX_IS_WINDOWS = package.config:sub(1, 1) == "\\"
+
+function subfix_home_dir()
+    return os.getenv("HOME") or os.getenv("USERPROFILE") or ""
+end
+
+function subfix_temp_root()
+    if SUBFIX_IS_WINDOWS then
+        return os.getenv("TEMP") or os.getenv("TMP") or "C:/Windows/Temp"
+    end
+    return os.getenv("TMPDIR") or "/tmp"
+end
+
+function subfix_cmd_path(path)
+    -- cmd.exe 的内建命令与重定向要求反斜杠路径
+    return tostring(path or ""):gsub("/", "\\")
+end
+
+function subfix_sleep(seconds)
+    local ok = pcall(function() bmd.wait(tonumber(seconds) or 0.1) end)
+    if ok then return end
+    if SUBFIX_IS_WINDOWS then
+        os.execute("ping -n 2 127.0.0.1 >nul")
+    else
+        os.execute(string.format("sleep %.2f", tonumber(seconds) or 0.1))
+    end
+end
+
+function subfix_ensure_dir(path)
+    if not SUBFIX_IS_WINDOWS then
+        local s = tostring(path or "")
+        os.execute("mkdir -p '" .. s:gsub("'", "'\\''") .. "' 2>/dev/null")
+        return true
+    end
+    os.execute('mkdir "' .. subfix_cmd_path(path) .. '" 2>nul')
+    -- ponytail: Lua 5.1 的 io/os 走 ANSI(GBK) API，而 UI 输入的路径是 UTF-8 字节，
+    -- 含中文时 cmd 会误读导致建目录失败；此处探测并在失败时明确提示。
+    -- 彻底解法是 LuaJIT FFI 调 CreateDirectoryW，待确认 Resolve 内嵌 LuaJIT 版本后升级。
+    local probe_path = subfix_cmd_path(tostring(path or "")) .. "\\.subfix_probe.tmp"
+    local probe = io.open(probe_path, "wb")
+    if probe then
+        probe:write("x")
+        probe:close()
+        os.remove(probe_path)
+        return true
+    end
+    print("[SubFix] 无法创建目录（路径含中文时 Windows 版可能受限，建议改用英文路径）: " .. tostring(path))
+    return false
+end
+
+function subfix_remove_files(...)
+    for index = 1, select("#", ...) do
+        local path = select(index, ...)
+        if type(path) == "string" and path ~= "" then
+            pcall(os.remove, path)
+        end
+    end
+end
+
+function subfix_kill_tree(pid)
+    pid = tonumber(pid)
+    if not pid or pid <= 0 then return end
+    if SUBFIX_IS_WINDOWS then
+        os.execute(string.format("taskkill /PID %d /T /F >nul 2>&1", pid))
+    else
+        os.execute(string.format("pkill -P %d 2>/dev/null; kill -9 %d 2>/dev/null", pid, pid))
+    end
+end
+
+-- Windows 后台任务：把命令写进 .cmd 批处理（含退出码/完成标记落盘），
+-- 再用 start /b 拉起。批处理先借 powershell 把自身 cmd.exe 的 PID 写入 pid 文件，
+-- 取消时 taskkill /T 连带杀掉 python/curl 子进程。
+-- ponytail: 批处理按 UTF-8 + chcp 65001 写出，依赖 cmd 在中文路径下按 65001 解析；
+-- 如遇罕见代码页问题，升级方向是改由 PowerShell -File 启动整个批处理。
+function subfix_write_bg_batch(batch_file, cmd_line, options)
+    options = type(options) == "table" and options or {}
+    local handle = io.open(batch_file, "wb")
+    if not handle then return false end
+    local lines = {
+        "@echo off",
+        "chcp 65001 >nul",
+        'set "PYTHONHOME="',
+        'set "PYTHONPATH="'
+    }
+    for _, pair in ipairs(options.env_pairs or {}) do
+        lines[#lines + 1] = 'set "' .. tostring(pair.name) .. '=' .. tostring(pair.value) .. '"'
+    end
+    if options.pid_file and options.pid_file ~= "" then
+        lines[#lines + 1] = string.format(
+            'powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter (\'ProcessId=\' + $PID)).ParentProcessId | Set-Content -LiteralPath \'%s\'" >nul 2>&1',
+            subfix_cmd_path(options.pid_file))
+    end
+    lines[#lines + 1] = string.format('%s > "%s" 2>&1', cmd_line, subfix_cmd_path(options.stdout_file or ""))
+    if options.exit_file and options.exit_file ~= "" then
+        lines[#lines + 1] = string.format('echo %%errorlevel%% > "%s"', subfix_cmd_path(options.exit_file))
+    end
+    if options.done_file and options.done_file ~= "" then
+        lines[#lines + 1] = string.format('type nul > "%s"', subfix_cmd_path(options.done_file))
+    end
+    handle:write(table.concat(lines, "\r\n") .. "\r\n")
+    handle:close()
+    return true
+end
+
+function subfix_launch_bg_batch(batch_file)
+    os.execute('start "SubFixBG" /b cmd /c "' .. subfix_cmd_path(batch_file) .. '"')
+end
+
 SUBFIX_VERSION = "3.3.0"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
@@ -43,6 +155,22 @@ SUBFIX_WINDOW_GEOMETRY = SUBFIX_WINDOW_GEOMETRY or {}
 
 function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
     if not (io and io.popen) then return nil end
+
+    if SUBFIX_IS_WINDOWS then
+        -- ponytail: 用虚拟屏幕近似 mac 端“与 Resolve 主窗重叠最大的屏”；
+        -- 多显示器精确定位可升级为 EnumDisplayMonitors + MonitorFromWindow。
+        local pipe = io.popen('powershell -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; \\"$($b.X),$($b.Y),$($b.Width),$($b.Height)\\"" 2>nul', "r")
+        if pipe then
+            local output = pipe:read("*a") or ""
+            pipe:close()
+            local x, y, width, height = output:match("^%s*([%-%.%d]+),([%-%.%d]+),([%-%.%d]+),([%-%.%d]+)%s*$")
+            x, y, width, height = tonumber(x), tonumber(y), tonumber(width), tonumber(height)
+            if x and y and width and height and width > 0 and height > 0 then
+                return {x = x, y = y, width = width, height = height}
+            end
+        end
+        return nil
+    end
 
     -- JXA 的返回值写入 stdout；console.log 写入 stderr，会被下面的重定向丢弃。
     local jxa = [[(function () {
@@ -1216,8 +1344,7 @@ end
 
 function ensure_backup_directory()
     if current_backup_path == "" then return end
-    os.execute('mkdir -p "' .. current_backup_path .. '" 2>/dev/null')
-    os.execute('mkdir "' .. current_backup_path .. '" 2>nul')
+    subfix_ensure_dir(current_backup_path)
 end
 
 function get_backup_manifest_path()
@@ -6021,6 +6148,9 @@ end
 
 local function shell_quote(value)
     local s = tostring(value or "")
+    if SUBFIX_IS_WINDOWS then
+        return '"' .. s:gsub('"', '""') .. '"'
+    end
     return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
@@ -6047,9 +6177,7 @@ function kill_ai_curl_process()
             local pid = trim_text(pf:read("*l") or "")
             pf:close()
             if pid ~= "" and pid:match("^%d+$") then
-                os.execute(string.format(
-                    "pkill -P %s 2>/dev/null; kill -9 %s 2>/dev/null",
-                    pid, pid))
+                subfix_kill_tree(pid)
             end
         end
     end)
@@ -6307,9 +6435,7 @@ function kill_normalize_background_process(pid_file)
             local pid = trim_text(pf:read("*l") or "")
             pf:close()
             if pid ~= "" and pid:match("^%d+$") then
-                os.execute(string.format(
-                    "pkill -P %s 2>/dev/null; kill -9 %s 2>/dev/null",
-                    pid, pid))
+                subfix_kill_tree(pid)
             end
         end
     end)
@@ -6394,10 +6520,12 @@ end
 function run_subfix_background_command(cmd, options)
     options = type(options) == "table" and options or {}
     local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
-    local stdout_file = "/tmp/subfix_bg_stdout_" .. uid
-    local pid_file = "/tmp/subfix_bg_pid_" .. uid
-    local done_file = "/tmp/subfix_bg_done_" .. uid
-    local exit_file = "/tmp/subfix_bg_exit_" .. uid
+    local temp_root = subfix_temp_root()
+    local stdout_file = temp_root .. "/subfix_bg_stdout_" .. uid
+    local pid_file = temp_root .. "/subfix_bg_pid_" .. uid
+    local done_file = temp_root .. "/subfix_bg_done_" .. uid
+    local exit_file = temp_root .. "/subfix_bg_exit_" .. uid
+    local batch_file = temp_root .. "/subfix_bg_" .. uid .. ".cmd"
     local progress_file = options.progress_path
     local cancelled = false
     local output = ""
@@ -6409,18 +6537,29 @@ function run_subfix_background_command(cmd, options)
         return NORMALIZE_CANCEL_REQUESTED == true or is_normalize_progress_cancelled()
     end
 
-    os.execute(string.format("rm -f %s %s %s %s 2>/dev/null",
-        shell_quote(stdout_file), shell_quote(pid_file), shell_quote(done_file), shell_quote(exit_file)))
+    if SUBFIX_IS_WINDOWS then
+        subfix_remove_files(stdout_file, pid_file, done_file, exit_file)
+        subfix_write_bg_batch(batch_file, cmd, {
+            pid_file = pid_file,
+            stdout_file = stdout_file,
+            exit_file = exit_file,
+            done_file = done_file
+        })
+        subfix_launch_bg_batch(batch_file)
+    else
+        os.execute(string.format("rm -f %s %s %s %s 2>/dev/null",
+            shell_quote(stdout_file), shell_quote(pid_file), shell_quote(done_file), shell_quote(exit_file)))
 
-    local bg_cmd = string.format(
-        "(%s > %s 2>&1; echo $? > %s; touch %s) & echo $! > %s",
-        cmd,
-        shell_quote(stdout_file),
-        shell_quote(exit_file),
-        shell_quote(done_file),
-        shell_quote(pid_file)
-    )
-    os.execute(bg_cmd)
+        local bg_cmd = string.format(
+            "(%s > %s 2>&1; echo $? > %s; touch %s) & echo $! > %s",
+            cmd,
+            shell_quote(stdout_file),
+            shell_quote(exit_file),
+            shell_quote(done_file),
+            shell_quote(pid_file)
+        )
+        os.execute(bg_cmd)
+    end
     NORMALIZE_HELPER_PID_FILE = pid_file
 
     local poll_timer_id = "SubFixBackgroundPollTimer_" .. uid
@@ -6550,7 +6689,7 @@ function run_subfix_background_command(cmd, options)
             end
             local df = io.open(done_file, "r")
             if df then df:close(); break end
-            os.execute("sleep 0.15")
+            subfix_sleep(0.15)
         end
     end
 
@@ -6571,12 +6710,7 @@ function run_subfix_background_command(cmd, options)
         NORMALIZE_HELPER_PID_FILE = nil
     end
 
-    os.execute(string.format("rm -f %s %s %s %s %s 2>/dev/null",
-        shell_quote(stdout_file),
-        shell_quote(pid_file),
-        shell_quote(done_file),
-        shell_quote(exit_file),
-        progress_file and shell_quote(progress_file) or "''"))
+    subfix_remove_files(stdout_file, pid_file, done_file, exit_file, progress_file, batch_file)
 
     if cancelled then
         return false, "已取消", "cancelled"
@@ -8544,22 +8678,38 @@ end
 
 function SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
     local support_root = SUBFIX_AUDIO_ALIGN.resolve_support_root()
-    local bundled = support_root .. "/.subfix_support/bin/ffmpeg"
-    if SUBFIX_AUDIO_ALIGN.file_exists(bundled) then
-        return bundled
+    local bundled_names = SUBFIX_IS_WINDOWS
+        and { "/.subfix_support/bin/ffmpeg.exe", "/.subfix_support/bin/ffmpeg" }
+        or { "/.subfix_support/bin/ffmpeg" }
+    for _, suffix in ipairs(bundled_names) do
+        local bundled = support_root .. suffix
+        if SUBFIX_AUDIO_ALIGN.file_exists(bundled) then
+            return bundled
+        end
     end
 
-    local home_dir = os.getenv("HOME") or ""
-    local user_local = home_dir ~= "" and (home_dir .. "/.local/bin/ffmpeg") or ""
-    if user_local ~= "" and SUBFIX_AUDIO_ALIGN.file_exists(user_local) then
-        return user_local
+    if not SUBFIX_IS_WINDOWS then
+        local home_dir = os.getenv("HOME") or ""
+        local user_local = home_dir ~= "" and (home_dir .. "/.local/bin/ffmpeg") or ""
+        if user_local ~= "" and SUBFIX_AUDIO_ALIGN.file_exists(user_local) then
+            return user_local
+        end
     end
 
-    local ok, output = run_shell_capture("command -v ffmpeg")
+    local ok, output = run_shell_capture(SUBFIX_IS_WINDOWS and "where ffmpeg" or "command -v ffmpeg")
     if ok then
-        local path = trim_text(output or "")
-        if path ~= "" then
-            return path
+        -- where 在 Windows 可能输出多行候选（含 PATH 里已失效的条目），逐行取第一个真实存在的；
+        -- mac 的 command -v 单行且已确认存在，直接沿用第一行。
+        for line in tostring(output or ""):gmatch("[^\r\n]+") do
+            line = trim_text(line)
+            if line ~= "" then
+                if not SUBFIX_IS_WINDOWS then
+                    return line
+                end
+                if SUBFIX_AUDIO_ALIGN.file_exists(line) then
+                    return line
+                end
+            end
         end
     end
     return nil
@@ -8570,11 +8720,10 @@ function SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message(action)
 end
 
 function SUBFIX_AUDIO_ALIGN.timeline_audio_mix_temp_dir()
-    local base_dir = current_backup_path ~= "" and current_backup_path or "/tmp"
+    local base_dir = current_backup_path ~= "" and current_backup_path or subfix_temp_root()
     ensure_backup_directory()
     local dir_path = join_path(base_dir, "SubFix_TimelineAudio")
-    os.execute("mkdir -p " .. shell_quote(dir_path) .. " 2>/dev/null")
-    os.execute("mkdir " .. shell_quote(dir_path) .. " 2>nul")
+    subfix_ensure_dir(dir_path)
     return dir_path
 end
 
@@ -8669,7 +8818,7 @@ function SUBFIX_AUDIO_ALIGN.wait_for_timeline_render_job(project, job_id, option
                 pcall(function() project:StopRendering() end)
                 break
             end
-            os.execute("sleep 0.25")
+            subfix_sleep(0.25)
         end
     end
 
@@ -9083,8 +9232,21 @@ function SUBFIX_AUDIO_ALIGN.get_asr_paths()
     local legacy_helper = script_dir .. "/subfix_asr_transcribe.py"
     local legacy_setup = script_dir .. "/setup_asr_env.sh"
     local legacy_python = script_dir .. "/.subfix_asr_env/bin/python"
-    local home_dir = os.getenv("HOME") or ""
-    local user_python = home_dir .. "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/.subfix_asr_env/bin/python"
+    local home_dir = subfix_home_dir()
+    local user_python
+    if SUBFIX_IS_WINDOWS then
+        -- Windows venv 布局：python.exe 在 Scripts/ 下；内置运行时在 runtime/python 根目录
+        setup = helper_dir .. "/setup_asr_env.cmd"
+        visible_setup = visible_helper_dir .. "/setup_asr_env.cmd"
+        legacy_setup = script_dir .. "/setup_asr_env.cmd"
+        python = helper_dir .. "/.subfix_asr_env/Scripts/python.exe"
+        visible_python = visible_helper_dir .. "/.subfix_asr_env/Scripts/python.exe"
+        legacy_python = script_dir .. "/.subfix_asr_env/Scripts/python.exe"
+        runtime_python = helper_dir .. "/runtime/python/python.exe"
+        user_python = home_dir ~= "" and (home_dir .. "/AppData/Roaming/Blackmagic Design/DaVinci Resolve/Support/Fusion/Scripts/Utility/.subfix_support/.subfix_asr_env/Scripts/python.exe") or ""
+    else
+        user_python = home_dir ~= "" and (home_dir .. "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/.subfix_asr_env/bin/python") or ""
+    end
 
     if not SUBFIX_AUDIO_ALIGN.file_exists(helper) and SUBFIX_AUDIO_ALIGN.file_exists(visible_helper) then
         helper = visible_helper
@@ -9167,7 +9329,7 @@ function SUBFIX_AUDIO_ALIGN.run_asr_alignment(audio_source, fps, options)
         return nil, "缺少 ASR helper: " .. tostring(paths.helper)
     end
     if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "ASR 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
+        return nil, "ASR 环境未安装，请先运行: " .. shell_quote(paths.setup)
     end
 
     local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
@@ -9421,7 +9583,7 @@ function SUBFIX_AUDIO_ALIGN.run_asr_review_windows(review_windows, fps, options)
         return nil, "缺少 ASR helper: " .. tostring(paths.helper)
     end
     if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "ASR 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
+        return nil, "ASR 环境未安装，请先运行: " .. shell_quote(paths.setup)
     end
 
     local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
@@ -9605,7 +9767,7 @@ function SUBFIX_AUDIO_ALIGN.run_stable_ts_alignment(audio_source, source_rows, f
         return nil, "缺少 stable-ts helper: " .. tostring(paths.helper)
     end
     if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "stable-ts 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
+        return nil, "stable-ts 环境未安装，请先运行: " .. shell_quote(paths.setup)
     end
 
     local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
@@ -9701,7 +9863,7 @@ function SUBFIX_AUDIO_ALIGN.run_text_alignment(audio_source, source_rows, fps)
         return nil, "缺少 stable-ts helper: " .. tostring(paths.helper)
     end
     if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "stable-ts 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
+        return nil, "stable-ts 环境未安装，请先运行: " .. shell_quote(paths.setup)
     end
 
     local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
@@ -9792,7 +9954,7 @@ function SUBFIX_AUDIO_ALIGN.run_whisperx_text_alignment(audio_source, source_row
         return nil, "缺少 WhisperX helper: " .. tostring(paths.helper)
     end
     if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "WhisperX 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
+        return nil, "WhisperX 环境未安装，请先运行: " .. shell_quote(paths.setup)
     end
 
     local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
@@ -9885,7 +10047,7 @@ function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment(audio_source, source_rows, fp
         return nil, "缺少 CTC helper: " .. tostring(paths.helper)
     end
     if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "CTC 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
+        return nil, "CTC 环境未安装，请先运行: " .. shell_quote(paths.setup)
     end
 
     local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
@@ -9988,7 +10150,7 @@ function SUBFIX_AUDIO_ALIGN.run_lightweight_onset_detection(audio_source, fps)
         return nil, "缺少 onset helper: " .. tostring(paths.helper)
     end
     if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "onset 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
+        return nil, "onset 环境未安装，请先运行: " .. shell_quote(paths.setup)
     end
 
     local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
@@ -10870,7 +11032,7 @@ function SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(batch_plan, fps, b
         return nil, { diagnostic = "缺少 Qwen 对齐 helper: " .. tostring(paths.helper) }
     end
     if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, { diagnostic = "Qwen 运行环境未安装，请先在终端运行: " .. shell_quote(paths.setup) }
+        return nil, { diagnostic = "Qwen 运行环境未安装，请先运行: " .. shell_quote(paths.setup) }
     end
 
     local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
@@ -16764,25 +16926,37 @@ local function do_ai_fix()
             local request_was_cancelled = false
             local nested_runloop_failed = false
             local req_uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
-            local stdout_file = "/tmp/hooper_curl_stdout_" .. req_uid
-            local pid_file    = "/tmp/hooper_curl_pid_"    .. req_uid
-            local done_file   = "/tmp/hooper_curl_done_"   .. req_uid
+            local temp_root = subfix_temp_root()
+            local stdout_file = temp_root .. "/hooper_curl_stdout_" .. req_uid
+            local pid_file    = temp_root .. "/hooper_curl_pid_"    .. req_uid
+            local done_file   = temp_root .. "/hooper_curl_done_"   .. req_uid
+            local batch_file  = temp_root .. "/hooper_curl_"        .. req_uid .. ".cmd"
 
             -- 清理可能残留的旧文件
-            os.execute(string.format("rm -f %s %s %s 2>/dev/null",
-                shell_quote(stdout_file), shell_quote(pid_file), shell_quote(done_file)))
+            subfix_remove_files(stdout_file, pid_file, done_file, batch_file)
 
-            -- 注意 curl_cmd 末尾已经带 2>&1；外层再加 > stdout_file 把全部合并输出落盘。
-            -- 子 shell 形式 ( ... ) & 让 echo $! 拿到的是子 shell 的 PID，
-            -- curl 是它直接子进程，pkill -P <子shell PID> 可以连带杀掉 curl。
-            local bg_cmd = string.format(
-                "(%s > %s; touch %s) & echo $! > %s",
-                curl_cmd,
-                shell_quote(stdout_file),
-                shell_quote(done_file),
-                shell_quote(pid_file)
-            )
-            os.execute(bg_cmd)
+            if SUBFIX_IS_WINDOWS then
+                -- curl_cmd 末尾已带 2>&1，批处理里再整体重定向落盘；
+                -- pid 文件由批处理写入其 cmd.exe 的 PID，取消时 taskkill /T 连 curl 一起杀。
+                subfix_write_bg_batch(batch_file, curl_cmd, {
+                    pid_file = pid_file,
+                    stdout_file = stdout_file,
+                    done_file = done_file
+                })
+                subfix_launch_bg_batch(batch_file)
+            else
+                -- 注意 curl_cmd 末尾已经带 2>&1；外层再加 > stdout_file 把全部合并输出落盘。
+                -- 子 shell 形式 ( ... ) & 让 echo $! 拿到的是子 shell 的 PID，
+                -- curl 是它直接子进程，pkill -P <子shell PID> 可以连带杀掉 curl。
+                local bg_cmd = string.format(
+                    "(%s > %s; touch %s) & echo $! > %s",
+                    curl_cmd,
+                    shell_quote(stdout_file),
+                    shell_quote(done_file),
+                    shell_quote(pid_file)
+                )
+                os.execute(bg_cmd)
+            end
 
             AI_RUNNING = true
             AI_CURL_PID_FILE = pid_file
@@ -16817,9 +16991,7 @@ local function do_ai_fix()
                         pf:close()
                         if pid and trim_text(pid) ~= "" then
                             local clean_pid = trim_text(pid)
-                            os.execute(string.format(
-                                "pkill -P %s 2>/dev/null; kill -9 %s 2>/dev/null",
-                                clean_pid, clean_pid))
+                            subfix_kill_tree(clean_pid)
                         end
                     end
                     stop_and_exit_nested()
@@ -16865,9 +17037,7 @@ local function do_ai_fix()
                             local pid = pf:read("*l"); pf:close()
                             if pid and trim_text(pid) ~= "" then
                                 local clean_pid = trim_text(pid)
-                                os.execute(string.format(
-                                    "pkill -P %s 2>/dev/null; kill -9 %s 2>/dev/null",
-                                    clean_pid, clean_pid))
+                                subfix_kill_tree(clean_pid)
                             end
                         end
                         break
@@ -16880,8 +17050,7 @@ local function do_ai_fix()
 
             -- 用户取消：清理临时文件并以特殊错误返回，让上层 batch 循环识别 cancelled
             if request_was_cancelled or AI_CANCEL_REQUESTED then
-                os.execute(string.format("rm -f %s %s %s 2>/dev/null",
-                    shell_quote(stdout_file), shell_quote(pid_file), shell_quote(done_file)))
+                subfix_remove_files(stdout_file, pid_file, done_file)
                 return nil, nil, "❌ 已取消 AI 请求", "cancelled"
             end
 
@@ -16893,8 +17062,7 @@ local function do_ai_fix()
             end
 
             -- 清理临时文件
-            os.execute(string.format("rm -f %s %s %s 2>/dev/null",
-                shell_quote(stdout_file), shell_quote(pid_file), shell_quote(done_file)))
+            subfix_remove_files(stdout_file, pid_file, done_file)
         end
 
         print("[Hooper AI 2.0] curl 输出: " .. curl_output)
@@ -17662,8 +17830,7 @@ local function export_srt()
         return false
     end
 
-    os.execute('mkdir -p "' .. current_backup_path .. '" 2>/dev/null')
-    os.execute('mkdir "' .. current_backup_path .. '" 2>nul')
+    subfix_ensure_dir(current_backup_path)
 
     local sep = (current_backup_path:sub(-1) == "\\" or current_backup_path:sub(-1) == "/") and "" or "/"
     local file_name = "HooperAI_导出_" .. os.date("%m%d_%H%M%S") .. ".srt"
@@ -21793,8 +21960,7 @@ function win.On.ExportSrtBtn.Clicked(ev)
         return
     end
 
-    os.execute('mkdir -p "' .. current_backup_path .. '" 2>/dev/null')
-    os.execute('mkdir "' .. current_backup_path .. '" 2>nul')
+    subfix_ensure_dir(current_backup_path)
 
     local sep = (current_backup_path:sub(-1) == "\\" or current_backup_path:sub(-1) == "/") and "" or "/"
     local file_name = "HooperAI_双语_" .. os.date("%m%d_%H%M%S") .. ".srt"
@@ -21922,9 +22088,15 @@ function win.On.SetPathBtn.Clicked(ev)
 end
 
 function subfix_update_helper_path()
-    local home = os.getenv("HOME") or ""
-    local user_path = home ~= "" and (home .. "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/subfix_update.py") or nil
-    local system_path = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/subfix_update.py"
+    local home = subfix_home_dir()
+    local user_path, system_path
+    if SUBFIX_IS_WINDOWS then
+        user_path = home ~= "" and (home .. "/AppData/Roaming/Blackmagic Design/DaVinci Resolve/Support/Fusion/Scripts/Utility/.subfix_support/subfix_update.py") or nil
+        system_path = "C:/ProgramData/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/subfix_update.py"
+    else
+        user_path = home ~= "" and (home .. "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/subfix_update.py") or nil
+        system_path = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/subfix_update.py"
+    end
     local file = user_path and io.open(user_path, "r") or nil
     if file then file:close(); return user_path end
     file = io.open(system_path, "r")
@@ -21936,7 +22108,7 @@ function subfix_update_python_path(helper)
     local bundled_python = tostring(helper or ""):gsub("/subfix_update%.py$", "/runtime/python/bin/python3")
     local file = bundled_python ~= "" and io.open(bundled_python, "r") or nil
     if file then file:close(); return bundled_python end
-    local ok_python, python = run_shell_capture("command -v python3 2>/dev/null")
+    local ok_python, python = run_shell_capture(SUBFIX_IS_WINDOWS and "where python 2>nul" or "command -v python3 2>/dev/null")
     python = trim_text(python or "")
     return ok_python and python ~= "" and python or nil
 end
@@ -21975,7 +22147,7 @@ function run_subfix_update_with_progress(cmd, output_path, task_name, cancellabl
         progress_path = progress_path
     })
     local result = decode_json_text(read_text_file(output_path) or "")
-    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
+    pcall(os.remove, output_path)
     if progress_path then os.remove(progress_path) end
     if status == "cancelled" then
         message = "已取消" .. task_name
@@ -22009,11 +22181,12 @@ function run_subfix_update_check(cmd, output_path)
 end
 
 function run_subfix_update(payload)
+    if SUBFIX_IS_WINDOWS then return false, "Windows 版暂不支持在线更新，请到 GitHub Releases 手动下载" end
     local helper = subfix_update_helper_path()
     if not helper then return false, "缺少更新器，请先安装包含更新功能的 SubFix 版本" end
     local python = subfix_update_python_path(helper)
     if not python then return false, "未找到 Python 3，无法安装更新" end
-    local output_path = "/tmp/subfix_update_install_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
+    local output_path = subfix_temp_root() .. "/subfix_update_install_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
     local progress_path = output_path .. ".progress.json"
     local cmd = table.concat({
         shell_quote(python), shell_quote(helper),
@@ -22033,11 +22206,15 @@ function win.On.CheckUpdateBtn.Clicked(ev)
     SUBFIX_UPDATE_RUNNING = true
     pcall(function() win:GetItems().CheckUpdateBtn.Enabled = false end)
     local succeeded, failure = pcall(function()
+        if SUBFIX_IS_WINDOWS then
+            update_shared_status(win, "Windows 版暂不支持在线更新，请到 GitHub Releases 手动下载")
+            return
+        end
         local helper = subfix_update_helper_path()
         if not helper then update_shared_status(win, "缺少更新器；请先安装含更新功能的版本"); return end
         local python = subfix_update_python_path(helper)
         if not python then update_shared_status(win, "未找到 Python 3，无法检查更新"); return end
-        local output_path = "/tmp/subfix_update_check_" .. tostring(os.time()) .. ".json"
+        local output_path = subfix_temp_root() .. "/subfix_update_check_" .. tostring(os.time()) .. ".json"
         local cmd = table.concat({shell_quote(python), shell_quote(helper), "check", "--current-version", shell_quote(SUBFIX_VERSION), "--output", shell_quote(output_path)}, " ")
         update_shared_status(win, "正在检查 SubFix 更新...")
         local ok, payload = run_subfix_update_check(cmd, output_path)
@@ -22107,9 +22284,7 @@ function force_quit_subfix()
                 pf:close()
                 if pid and trim_text(pid) ~= "" then
                     local clean_pid = trim_text(pid)
-                    os.execute(string.format(
-                        "pkill -P %s 2>/dev/null; kill -9 %s 2>/dev/null",
-                        clean_pid, clean_pid))
+                    subfix_kill_tree(clean_pid)
                 end
             end
         end)

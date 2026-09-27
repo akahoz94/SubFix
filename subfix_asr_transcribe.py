@@ -230,6 +230,7 @@ QWEN_ROW_REMAP_MAX_START_LOOKBACK = 2
 QWEN_ROW_REMAP_MAX_START_LOOKAHEAD = 12
 DEFAULT_FFMPEG_CANDIDATES = (
     str(Path(__file__).resolve().parent / "bin" / "ffmpeg"),
+    str(Path(__file__).resolve().parent / "bin" / "ffmpeg.exe"),
     str(Path.home() / ".local" / "bin" / "ffmpeg"),
     "/opt/homebrew/bin/ffmpeg",
     "/usr/local/bin/ffmpeg",

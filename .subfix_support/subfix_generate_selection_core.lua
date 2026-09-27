@@ -30,8 +30,115 @@ if dispatcher and dispatcher.On then
     end
 end
 
+-- ========== Windows 兼容层 ==========
+-- 与 SubFix.lua 顶部的实现保持一致；Resolve 在 Windows 上通过 cmd.exe 执行 os.execute/io.popen。
+SUBFIX_IS_WINDOWS = package.config:sub(1, 1) == "\\"
+
+function subfix_home_dir()
+    return os.getenv("HOME") or os.getenv("USERPROFILE") or ""
+end
+
+function subfix_temp_root()
+    if SUBFIX_IS_WINDOWS then
+        return os.getenv("TEMP") or os.getenv("TMP") or "C:/Windows/Temp"
+    end
+    return os.getenv("TMPDIR") or "/tmp"
+end
+
+function subfix_cmd_path(path)
+    -- cmd.exe 的内建命令与重定向要求反斜杠路径
+    return tostring(path or ""):gsub("/", "\\")
+end
+
+function subfix_sleep(seconds)
+    local ok = pcall(function() bmd.wait(tonumber(seconds) or 0.1) end)
+    if ok then return end
+    if SUBFIX_IS_WINDOWS then
+        os.execute("ping -n 2 127.0.0.1 >nul")
+    else
+        os.execute(string.format("sleep %.2f", tonumber(seconds) or 0.1))
+    end
+end
+
+function subfix_ensure_dir(path)
+    if not SUBFIX_IS_WINDOWS then
+        local s = tostring(path or "")
+        os.execute("mkdir -p '" .. s:gsub("'", "'\\''") .. "' 2>/dev/null")
+        return true
+    end
+    os.execute('mkdir "' .. subfix_cmd_path(path) .. '" 2>nul')
+    -- ponytail: 与 SubFix.lua 同名函数一致，中文路径探测失败时明确提示（Lua 5.1 ANSI 限制）。
+    local probe_path = subfix_cmd_path(tostring(path or "")) .. "\\.subfix_probe.tmp"
+    local probe = io.open(probe_path, "wb")
+    if probe then
+        probe:write("x")
+        probe:close()
+        os.remove(probe_path)
+        return true
+    end
+    print("[SubFix] 无法创建目录（路径含中文时 Windows 版可能受限，建议改用英文路径）: " .. tostring(path))
+    return false
+end
+
+function subfix_remove_files(...)
+    for index = 1, select("#", ...) do
+        local path = select(index, ...)
+        if type(path) == "string" and path ~= "" then
+            pcall(os.remove, path)
+        end
+    end
+end
+
+function subfix_kill_tree(pid)
+    pid = tonumber(pid)
+    if not pid or pid <= 0 then return end
+    if SUBFIX_IS_WINDOWS then
+        os.execute(string.format("taskkill /PID %d /T /F >nul 2>&1", pid))
+    else
+        os.execute(string.format("pkill -P %d 2>/dev/null; kill -9 %d 2>/dev/null", pid, pid))
+    end
+end
+
+-- Windows 后台任务批处理模板，说明见 SubFix.lua 同名函数。
+function subfix_write_bg_batch(batch_file, cmd_line, options)
+    options = type(options) == "table" and options or {}
+    local handle = io.open(batch_file, "wb")
+    if not handle then return false end
+    local lines = {
+        "@echo off",
+        "chcp 65001 >nul",
+        'set "PYTHONHOME="',
+        'set "PYTHONPATH="'
+    }
+    for _, pair in ipairs(options.env_pairs or {}) do
+        lines[#lines + 1] = 'set "' .. tostring(pair.name) .. '=' .. tostring(pair.value) .. '"'
+    end
+    if options.pid_file and options.pid_file ~= "" then
+        lines[#lines + 1] = string.format(
+            'powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter (\'ProcessId=\' + $PID)).ParentProcessId | Set-Content -LiteralPath \'%s\'" >nul 2>&1',
+            subfix_cmd_path(options.pid_file))
+    end
+    lines[#lines + 1] = string.format('%s > "%s" 2>&1', cmd_line, subfix_cmd_path(options.stdout_file or ""))
+    if options.exit_file and options.exit_file ~= "" then
+        lines[#lines + 1] = string.format('echo %%errorlevel%% > "%s"', subfix_cmd_path(options.exit_file))
+    end
+    if options.done_file and options.done_file ~= "" then
+        lines[#lines + 1] = string.format('type nul > "%s"', subfix_cmd_path(options.done_file))
+    end
+    handle:write(table.concat(lines, "\r\n") .. "\r\n")
+    handle:close()
+    return true
+end
+
+function subfix_launch_bg_batch(batch_file)
+    os.execute('start "SubFixBG" /b cmd /c "' .. subfix_cmd_path(batch_file) .. '"')
+end
+
 local function shell_quote(value)
     local text = tostring(value or "")
+    if SUBFIX_IS_WINDOWS then
+        return '"' .. text:gsub('"', '""') .. '"'
+    end
     return "'" .. text:gsub("'", "'\\''") .. "'"
 end
 
@@ -40,6 +147,22 @@ SUBFIX_WINDOW_GEOMETRY = SUBFIX_WINDOW_GEOMETRY or {}
 
 function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
     if not (io and io.popen) then return nil end
+
+    if SUBFIX_IS_WINDOWS then
+        -- ponytail: 用虚拟屏幕近似 mac 端“与 Resolve 主窗重叠最大的屏”；
+        -- 多显示器精确定位可升级为 EnumDisplayMonitors + MonitorFromWindow。
+        local pipe = io.popen('powershell -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; \\"$($b.X),$($b.Y),$($b.Width),$($b.Height)\\"" 2>nul', "r")
+        if pipe then
+            local output = pipe:read("*a") or ""
+            pipe:close()
+            local x, y, width, height = output:match("^%s*([%-%.%d]+),([%-%.%d]+),([%-%.%d]+),([%-%.%d]+)%s*$")
+            x, y, width, height = tonumber(x), tonumber(y), tonumber(width), tonumber(height)
+            if x and y and width and height and width > 0 and height > 0 then
+                return {x = x, y = y, width = width, height = height}
+            end
+        end
+        return nil
+    end
 
     -- JXA 的返回值写入 stdout；console.log 写入 stderr，会被下面的重定向丢弃。
     local jxa = [[(function () {
@@ -363,17 +486,29 @@ end
 local function resolve_asr_paths()
     local root = configured_script_root()
     local helper_dir = root .. "/.subfix_support"
-    local home_dir = os.getenv("HOME") or ""
-    local user_support_dir = home_dir ~= "" and (home_dir .. "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support") or helper_dir
-    local user_python = user_support_dir .. "/.subfix_asr_env/bin/python"
-    local user_runtime_python = user_support_dir .. "/runtime/python/bin/python3"
+    local home_dir = subfix_home_dir()
+    local user_support_dir
+    local venv_python_rel = "/.subfix_asr_env/bin/python"
+    local runtime_python_rel = "/runtime/python/bin/python3"
+    local setup_name = "setup_asr_env.sh"
+    if SUBFIX_IS_WINDOWS then
+        -- Windows 用户级脚本目录与 venv/python 运行时布局与 mac 不同
+        user_support_dir = home_dir ~= "" and (home_dir .. "/AppData/Roaming/Blackmagic Design/DaVinci Resolve/Support/Fusion/Scripts/Utility/.subfix_support") or helper_dir
+        venv_python_rel = "/.subfix_asr_env/Scripts/python.exe"
+        runtime_python_rel = "/runtime/python/python.exe"
+        setup_name = "setup_asr_env.cmd"
+    else
+        user_support_dir = home_dir ~= "" and (home_dir .. "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support") or helper_dir
+    end
+    local user_python = user_support_dir .. venv_python_rel
+    local user_runtime_python = user_support_dir .. runtime_python_rel
     local paths = {
         helper = helper_dir .. "/subfix_asr_transcribe.py",
         qwen_manager = helper_dir .. "/subfix_qwen_local_manager.py",
         process_group = helper_dir .. "/subfix_process_group.py",
-        setup = helper_dir .. "/setup_asr_env.sh",
-        python = helper_dir .. "/.subfix_asr_env/bin/python",
-        runtime_python = helper_dir .. "/runtime/python/bin/python3",
+        setup = helper_dir .. "/" .. setup_name,
+        python = helper_dir .. venv_python_rel,
+        runtime_python = helper_dir .. runtime_python_rel,
         diagnostic = user_support_dir .. "/last_generate_diagnostic.json",
         hotwords = user_support_dir .. "/hotwords.json"
     }
@@ -381,18 +516,18 @@ local function resolve_asr_paths()
         paths.helper = root .. "/subfix_asr_transcribe.py"
         paths.qwen_manager = root .. "/subfix_qwen_local_manager.py"
         paths.process_group = root .. "/subfix_process_group.py"
-        paths.setup = root .. "/setup_asr_env.sh"
-        paths.python = root .. "/.subfix_asr_env/bin/python"
-        paths.runtime_python = root .. "/runtime/python/bin/python3"
+        paths.setup = root .. "/" .. setup_name
+        paths.python = root .. venv_python_rel
+        paths.runtime_python = root .. runtime_python_rel
     end
     local module_dir = script_dir()
     if not file_exists(paths.helper) and file_exists(module_dir .. "/subfix_asr_transcribe.py") then
         paths.helper = module_dir .. "/subfix_asr_transcribe.py"
         paths.qwen_manager = module_dir .. "/subfix_qwen_local_manager.py"
         paths.process_group = module_dir .. "/subfix_process_group.py"
-        paths.setup = module_dir .. "/setup_asr_env.sh"
-        paths.python = module_dir .. "/.subfix_asr_env/bin/python"
-        paths.runtime_python = module_dir .. "/runtime/python/bin/python3"
+        paths.setup = module_dir .. "/" .. setup_name
+        paths.python = module_dir .. venv_python_rel
+        paths.runtime_python = module_dir .. runtime_python_rel
     end
     if not file_exists(paths.python) and file_exists(user_python) then
         paths.python = user_python
@@ -403,34 +538,66 @@ local function resolve_asr_paths()
     return paths
 end
 
+-- Windows 轻量包不内置 Python 运行时：runtime_python 缺失时依次回退
+-- venv python、系统 python（py/python）。mac 保持原行为不变。
+local function resolve_worker_python(paths)
+    if type(paths) ~= "table" then return nil end
+    if paths.runtime_python and file_exists(paths.runtime_python) then
+        return paths.runtime_python
+    end
+    if paths.python and file_exists(paths.python) then
+        return paths.python
+    end
+    if not SUBFIX_IS_WINDOWS then
+        return nil
+    end
+    for _, probe in ipairs({ "py -3 -c \"import sys;print(sys.executable)\"", "python -c \"import sys;print(sys.executable)\"" }) do
+        local handle = io.popen(probe .. " 2>nul")
+        if handle then
+            local output = (handle:read("*a") or ""):gsub("[\r\n]", "")
+            handle:close()
+            if output ~= "" and file_exists(output) then
+                return output
+            end
+        end
+    end
+    return nil
+end
+
 local function build_qwen_status_command(paths, output_path)
-    if not paths or not file_exists(paths.runtime_python) or not file_exists(paths.qwen_manager) then
+    local worker_python = resolve_worker_python(paths)
+    if not paths or not worker_python or not file_exists(paths.qwen_manager) then
         return nil, "未找到本地 Qwen 安装管理器"
     end
     return table.concat({
-        "env", "PYTHONDONTWRITEBYTECODE=1", shell_quote(paths.runtime_python), "-B", shell_quote(paths.qwen_manager),
+        shell_quote(worker_python), "-B", shell_quote(paths.qwen_manager),
         "--action", "status", "--output", shell_quote(output_path),
     }, " "), nil
 end
 
 local function inspect_local_qwen(paths)
-    local temporary_root = os.getenv("TMPDIR") or "/tmp"
+    local temporary_root = subfix_temp_root()
     local output_path = temporary_root .. "/subfix_qwen_status_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
     local cmd = build_qwen_status_command(paths, output_path)
     if not cmd then return {state = "missing", ready = false} end
-    os.execute(cmd .. " >/dev/null 2>&1")
+    if SUBFIX_IS_WINDOWS then
+        os.execute(cmd .. " >nul 2>&1")
+    else
+        os.execute(cmd .. " >/dev/null 2>&1")
+    end
     local payload = decode_json_text(read_text_file(output_path) or "")
-    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
+    subfix_remove_files(output_path)
     if type(payload) ~= "table" then return {state = "missing", ready = false} end
     payload.ready = payload.ready == true
     return payload
 end
 
 local function build_qwen_install_command(paths, output_path, progress_path)
-    if not file_exists(paths.runtime_python) then return nil, "未找到 SubFix 内置 Python" end
+    local worker_python = resolve_worker_python(paths)
+    if not worker_python then return nil, "未找到可用的 Python（请先安装 Python 3.10-3.13 并勾选加入 PATH）" end
     if not file_exists(paths.qwen_manager) then return nil, "缺少本地 Qwen 安装管理器" end
     return table.concat({
-        "env", "PYTHONDONTWRITEBYTECODE=1", shell_quote(paths.runtime_python), "-B", shell_quote(paths.qwen_manager),
+        shell_quote(worker_python), "-B", shell_quote(paths.qwen_manager),
         "--action", "install", "--output", shell_quote(output_path),
         "--progress-json", shell_quote(progress_path),
     }, " "), nil
@@ -629,8 +796,8 @@ local function save_generate_hotword_entries(entries)
 end
 
 local function temp_dir()
-    local root = (os.getenv("TMPDIR") or "/tmp") .. "/SubFix_GenerateSelectionSubtitles"
-    os.execute("mkdir -p " .. shell_quote(root) .. " 2>/dev/null")
+    local root = subfix_temp_root() .. "/SubFix_GenerateSelectionSubtitles"
+    subfix_ensure_dir(root)
     return root
 end
 
@@ -3113,9 +3280,9 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
         if qwen_status and qwen_status.ready and file_exists(qwen_status.python or "") then
             python = qwen_status.python
         else
-            python = paths.runtime_python
-            if not file_exists(python) then
-                return nil, "SubFix 内置 Python 缺失，请重新安装完整 SubFix 测试版"
+            python = resolve_worker_python(paths)
+            if not python then
+                return nil, "未找到可用的 Python（请先安装 Python 3.10-3.13 并勾选加入 PATH）"
             end
         end
     elseif not (qwen_status and qwen_status.ready and file_exists(qwen_status.python or "")) then
@@ -3125,11 +3292,18 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     end
     local generate_engine = resolve_generate_engine()
     local cmd_parts = {}
+    local env_pairs = {}
     if asr_backend == "auto" then
-        cmd_parts[#cmd_parts + 1] = "SUBFIX_QWEN3_ASR_MODEL=" .. shell_quote(qwen_status.model)
+        if SUBFIX_IS_WINDOWS then
+            -- cmd.exe 不支持 VAR=value 前缀，改由后台批处理 set 后再启动
+            env_pairs[#env_pairs + 1] = { name = "SUBFIX_QWEN3_ASR_MODEL", value = tostring(qwen_status.model or "") }
+        else
+            cmd_parts[#cmd_parts + 1] = "SUBFIX_QWEN3_ASR_MODEL=" .. shell_quote(qwen_status.model)
+        end
     end
     local command_args = {}
-    if qwen_status and qwen_status.ready and file_exists(qwen_status.python or "") then
+    if not SUBFIX_IS_WINDOWS and qwen_status and qwen_status.ready and file_exists(qwen_status.python or "") then
+        -- Windows 批处理模板已统一清空 PYTHONHOME/PYTHONPATH
         command_args = {"env", "-u", "PYTHONHOME", "-u", "PYTHONPATH"}
     end
     local helper_args = {
@@ -3164,15 +3338,20 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
         cmd_parts[#cmd_parts + 1] = "--hotwords-json"
         cmd_parts[#cmd_parts + 1] = shell_quote(hotwords_json)
     end
-    return table.concat(cmd_parts, " "), nil
+    return table.concat(cmd_parts, " "), nil, env_pairs
 end
 
 local function kill_background_process(pid_file)
     local pid_text = trim_text(read_text_file(pid_file) or "")
     local pid = tonumber(pid_text)
     if pid and pid > 0 then
-        os.execute("kill -TERM -- -" .. tostring(pid) .. " 2>/dev/null || kill -TERM " .. tostring(pid) .. " 2>/dev/null || true")
-        os.execute("sleep 0.2; kill -KILL -- -" .. tostring(pid) .. " 2>/dev/null || true")
+        if SUBFIX_IS_WINDOWS then
+            subfix_kill_tree(pid)
+        else
+            os.execute("kill -TERM -- -" .. tostring(pid) .. " 2>/dev/null || kill -TERM " .. tostring(pid) .. " 2>/dev/null || true")
+            subfix_sleep(0.2)
+            os.execute("kill -KILL -- -" .. tostring(pid) .. " 2>/dev/null || true")
+        end
     end
 end
 
@@ -3187,48 +3366,63 @@ local function progress_payload_signature(payload)
     }, "\n")
 end
 
-local function run_background_command_with_progress(cmd, progress_path, progress_state)
+local function run_background_command_with_progress(cmd, progress_path, progress_state, env_pairs)
+    env_pairs = type(env_pairs) == "table" and env_pairs or nil
     local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
     local root = temp_dir()
     local stdout_file = root .. "/asr_stdout_" .. uid .. ".log"
     local pid_file = root .. "/asr_pid_" .. uid
     local done_file = root .. "/asr_done_" .. uid
     local exit_file = root .. "/asr_exit_" .. uid
+    local batch_file = root .. "/asr_bg_" .. uid .. ".cmd"
     local output = ""
     local cancelled = false
     local paths = resolve_asr_paths()
-    if not file_exists(paths.runtime_python) then
-        return false, "未找到 SubFix 内置 Python", nil
+    local worker_python = resolve_worker_python(paths)
+    if not worker_python then
+        return false, "未找到可用的 Python（请先安装 Python 3.10-3.13 并勾选加入 PATH）", nil
     end
-    local grouped_cmd
-    if file_exists(paths.process_group) then
-        grouped_cmd = table.concat({
-            shell_quote(paths.runtime_python),
-            shell_quote(paths.process_group),
-            shell_quote(cmd),
-        }, " ")
+    if SUBFIX_IS_WINDOWS then
+        subfix_remove_files(stdout_file, pid_file, done_file, exit_file, batch_file)
+        subfix_write_bg_batch(batch_file, cmd, {
+            env_pairs = env_pairs,
+            pid_file = pid_file,
+            stdout_file = stdout_file,
+            exit_file = exit_file,
+            done_file = done_file
+        })
+        subfix_launch_bg_batch(batch_file)
     else
-        -- v3.2.0 cannot add new paths, so incremental upgrades need an inline equivalent.
-        local inline_group_code = 'import os,sys; os.setsid(); os.execl("/bin/sh", "sh", "-c", sys.argv[1])'
-        grouped_cmd = table.concat({
-            shell_quote(paths.runtime_python),
-            "-c",
-            shell_quote(inline_group_code),
-            shell_quote(cmd),
-        }, " ")
-    end
+        local grouped_cmd
+        if file_exists(paths.process_group) then
+            grouped_cmd = table.concat({
+                shell_quote(worker_python),
+                shell_quote(paths.process_group),
+                shell_quote(cmd),
+            }, " ")
+        else
+            -- v3.2.0 cannot add new paths, so incremental upgrades need an inline equivalent.
+            local inline_group_code = 'import os,sys; os.setsid(); os.execl("/bin/sh", "sh", "-c", sys.argv[1])'
+            grouped_cmd = table.concat({
+                shell_quote(worker_python),
+                "-c",
+                shell_quote(inline_group_code),
+                shell_quote(cmd),
+            }, " ")
+        end
 
-    -- Detach the waiting shell too: inherited host pipes can keep launch blocked
-    -- until the worker exits, preventing the progress event loop from starting.
-    local bg_cmd = string.format(
-        "(%s > %s 2>&1 & worker_pid=$!; echo $worker_pid > %s; wait $worker_pid; echo $? > %s; touch %s) </dev/null >/dev/null 2>&1 &",
-        grouped_cmd,
-        shell_quote(stdout_file),
-        shell_quote(pid_file),
-        shell_quote(exit_file),
-        shell_quote(done_file)
-    )
-    os.execute(bg_cmd)
+        -- Detach the waiting shell too: inherited host pipes can keep launch blocked
+        -- until the worker exits, preventing the progress event loop from starting.
+        local bg_cmd = string.format(
+            "(%s > %s 2>&1 & worker_pid=$!; echo $worker_pid > %s; wait $worker_pid; echo $? > %s; touch %s) </dev/null >/dev/null 2>&1 &",
+            grouped_cmd,
+            shell_quote(stdout_file),
+            shell_quote(pid_file),
+            shell_quote(exit_file),
+            shell_quote(done_file)
+        )
+        os.execute(bg_cmd)
+    end
 
     local timer_id = "GenerateProgressPollTimer_" .. uid
     local poll_timer = ui:Timer({ID = timer_id, Interval = 200, SingleShot = false})
@@ -3296,7 +3490,7 @@ local function run_background_command_with_progress(cmd, progress_path, progress
 
     output = read_text_file(stdout_file) or ""
     local exit_code = tonumber(trim_text(read_text_file(exit_file) or "")) or 1
-    os.execute(string.format("rm -f %s %s %s %s 2>/dev/null", shell_quote(stdout_file), shell_quote(pid_file), shell_quote(done_file), shell_quote(exit_file)))
+    subfix_remove_files(stdout_file, pid_file, done_file, exit_file, batch_file)
 
     if cancelled then
         return false, "已取消", "cancelled"
@@ -3315,8 +3509,8 @@ local function run_asr_helper_with_progress(audio_source, srt_path, json_path, t
             string.format("识别 %d/%d: %s", tonumber(source_index) or 0, tonumber(source_count) or 0, tostring(audio_source.file_name or audio_source.file_path or ""))
         )
     end
-    local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state)
-    os.execute("rm -f " .. shell_quote(progress_path) .. " 2>/dev/null")
+    local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state, env_pairs)
+    subfix_remove_files(progress_path)
     if not ok then
         return false, tostring(output or "ASR helper 执行失败"), status
     end
@@ -3360,7 +3554,7 @@ end
 
 local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_state, source_count, subtitle_mode, max_chars, backend, hotwords_json, effective_audio_seconds)
     local progress_path = json_path .. ".progress.json"
-    local cmd, cmd_err = build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend, hotwords_json)
+    local cmd, cmd_err, env_pairs = build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend, hotwords_json)
     if not cmd then return false, cmd_err end
     local duration_text = format_generate_audio_duration(effective_audio_seconds)
     update_generate_progress_window(
@@ -3368,8 +3562,8 @@ local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, jso
         {stage = "启动批量 ASR", message = string.format("准备识别 %d 段音频 · 有效音频 %s", tonumber(source_count) or 0, duration_text)},
         string.format("批量识别 %d 段音频 · 有效音频 %s", tonumber(source_count) or 0, duration_text)
     )
-    local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state)
-    os.execute("rm -f " .. shell_quote(progress_path) .. " 2>/dev/null")
+    local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state, env_pairs)
+    subfix_remove_files(progress_path)
     if not ok then
         return false, tostring(output or "ASR helper 执行失败"), status
     end
@@ -3421,10 +3615,10 @@ local function install_local_qwen_with_progress()
     local progress_state, progress_err = show_generate_progress_window()
     if not progress_state then return false, progress_err end
     update_generate_progress_window(progress_state, {stage = "准备下载", message = "正在准备本地 Qwen 安装", indeterminate = true})
-    local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state)
-    os.execute("rm -f " .. shell_quote(progress_path) .. " 2>/dev/null")
+    local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state, env_pairs)
+    subfix_remove_files(progress_path)
     local payload = decode_json_text(read_text_file(output_path) or "")
-    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
+    subfix_remove_files(output_path)
     if not ok then
         local message = type(payload) == "table" and tostring(payload.error or "") or ""
         if message == "" then message = tostring(output or "本地 Qwen 安装失败") end
@@ -3693,7 +3887,7 @@ local function import_rebuild_srt_with_retry(media_pool, rebuild_srt_path)
         last_error = ok_import and "Resolve 返回空媒体项" or tostring(items)
         if attempt < 2 then
             print("[SubFix Generate] 首次导入重建字幕 SRT 失败，准备重试: " .. tostring(last_error))
-            os.execute("sleep 0.25")
+            subfix_sleep(0.25)
         end
     end
     return nil, "导入重建字幕 SRT 失败（已重试）: " .. tostring(last_error)

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import sys
 import tempfile
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -274,6 +275,10 @@ def write_progress(path: Path | None, payload: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if os.name == "nt":
+        # Windows 发布包与 macOS 不同，在线更新只会拿到 mac 资产；请到 GitHub Releases 手动更新。
+        print("Windows 版暂不支持在线更新，请到 GitHub Releases 手动下载安装。", file=sys.stderr)
+        return 1
     parser = argparse.ArgumentParser(description="SubFix GitHub Release 更新器")
     subparsers = parser.add_subparsers(dest="action", required=True)
     check = subparsers.add_parser("check")

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -16,6 +15,11 @@ import sys
 import threading
 import time
 from typing import Callable
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 QWEN_ASR_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
@@ -42,6 +46,10 @@ class SubFixQwenPaths:
 
     @property
     def base_python(self) -> Path:
+        if os.name == "nt":
+            bundled = self.root / "runtime" / "python" / "python.exe"
+            # Windows 轻量包不内置运行时，回退到当前解释器（安装器本身在可用的 Python 里运行）
+            return bundled if bundled.is_file() else Path(sys.executable)
         return self.root / "runtime" / "python" / "bin" / "python3"
 
     @property
@@ -55,6 +63,8 @@ class SubFixQwenPaths:
 
     @property
     def env_python(self) -> Path:
+        if os.name == "nt":
+            return self.env_dir / "Scripts" / "python.exe"
         return self.env_dir / "bin" / "python"
 
     @property
@@ -93,15 +103,28 @@ def exclusive_install_lock(lock_path: Path):
     lock_file = lock_path.open("a+", encoding="utf-8")
     acquired = False
     try:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError(INSTALL_IN_PROGRESS_MESSAGE) from exc
+        if os.name == "nt":
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError(INSTALL_IN_PROGRESS_MESSAGE) from exc
+        else:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(INSTALL_IN_PROGRESS_MESSAGE) from exc
         acquired = True
         yield
     finally:
         if acquired:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            if os.name == "nt":
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         lock_file.close()
 
 
@@ -164,7 +187,7 @@ def has_model_artifacts(paths: SubFixQwenPaths) -> bool:
 def ready_environment_python(paths: SubFixQwenPaths) -> Path | None:
     if paths.env_python.is_file() and paths.ready_marker.is_file():
         return paths.env_python
-    legacy_python = paths.legacy_env_dir / "bin" / "python"
+    legacy_python = paths.legacy_env_dir / (Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python")
     # A legacy marker must never certify a newly created, incomplete environment.
     if legacy_python.is_file() and (paths.legacy_plugin_ready_marker.is_file() or paths.legacy_ready_marker.is_file()):
         return legacy_python
@@ -173,7 +196,8 @@ def ready_environment_python(paths: SubFixQwenPaths) -> Path | None:
 
 def inspect_install(paths: SubFixQwenPaths) -> dict[str, object]:
     model_dir = existing_model_dir(paths)
-    environment_exists = paths.env_python.is_file() or (paths.legacy_env_dir / "bin" / "python").is_file()
+    legacy_python_rel = Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python"
+    environment_exists = paths.env_python.is_file() or (paths.legacy_env_dir / legacy_python_rel).is_file()
     if not environment_exists or not has_model_artifacts(paths):
         return {"state": "missing", "ready": False}
     # The marker is written only after the installer verifies the dependency;
@@ -305,7 +329,8 @@ def run_checked(
 
 
 def create_or_reuse_venv(base_python: Path, env_dir: Path) -> None:
-    if not (env_dir / "bin" / "python").is_file():
+    env_python_rel = Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python"
+    if not (env_dir / env_python_rel).is_file():
         run_checked([str(base_python), "-m", "venv", str(env_dir)], error_prefix="创建本地 Qwen 环境失败")
 
 
@@ -591,7 +616,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     paths = SubFixQwenPaths(
         args.root.resolve(),
-        Path.home() / "Library" / "Application Support" / "SubFix",
+        Path.home() / "AppData" / "Roaming" / "SubFix" if os.name == "nt" else Path.home() / "Library" / "Application Support" / "SubFix",
     )
     try:
         if args.action == "install":
