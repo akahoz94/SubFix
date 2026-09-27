@@ -136,6 +136,7 @@ def build_stage(version: str, bundle_runtime: bool, qwen_cpp: Path | None = None
             raise SystemExit(f"--qwen-cpp 缺少 {cli}；先运行 scripts/windows/stage_qwen3_cpp.py")
         support_out = stage / ".subfix_support"
         shutil.copytree(src_bin, support_out / "bin", dirs_exist_ok=True)
+        (support_out / "models").mkdir(parents=True, exist_ok=True)
         dll_count = len(list((support_out / "bin").glob("*.dll")))
         ggufs = sorted((qwen_cpp / "models").glob("*.gguf")) if (qwen_cpp / "models").exists() else []
         for gguf in ggufs:
