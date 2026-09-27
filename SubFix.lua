@@ -54,6 +54,8 @@ if SUBFIX_IS_WINDOWS then
             int WriteFile(void *hFile, const char *lpBuffer, unsigned long nNumberOfBytesToWrite, unsigned long *lpNumberOfBytesWritten, void *lpOverlapped);
             int CloseHandle(void *hObject);
             int CreateProcessW(const wchar_t *lpApplicationName, wchar_t *lpCommandLine, void *lpProcessAttributes, void *lpThreadAttributes, int bInheritHandles, unsigned long dwCreationFlags, void *lpEnvironment, const wchar_t *lpCurrentDirectory, void *lpStartupInfo, void *lpProcessInformation);
+            int WaitForSingleObject(void *hHandle, unsigned long dwMilliseconds);
+            int GetExitCodeProcess(void *hProcess, unsigned long *lpExitCode);
             typedef struct { DWORD cb; wchar_t *lpReserved; wchar_t *lpDesktop; wchar_t *lpTitle; DWORD dwX; DWORD dwY; DWORD dwXSize; DWORD dwYSize; DWORD dwXCountChars; DWORD dwYCountChars; DWORD dwFillAttribute; DWORD dwFlags; unsigned short wShowWindow; unsigned short cbReserved2; unsigned char *lpReserved2; void *hStdInput; void *hStdOutput; void *hStdError; } STARTUPINFOW;
             typedef struct { void *hProcess; void *hThread; DWORD dwProcessId; DWORD dwThreadId; } PROCESS_INFORMATION;
         ]]
@@ -163,6 +165,45 @@ if SUBFIX_IS_WINDOWS then
     end
 end
 
+-- 隐藏执行并等待结束，返回退出码（Windows 版 os.execute，无黑色 cmd 窗口）。
+-- 语义与 os.execute 一致（同步等待；重定向由调用方提供）；FFI 不可用时回退 os.execute。
+-- 实现：把命令写入临时 .bat 再 cmd /c 执行——命令在 bat 内原样运行，
+-- 彻底规避 cmd 直接解析命令时的引号剥离/转义问题；chcp 65001 保证 UTF-8 中文路径。
+-- 用途：taskkill / 清理 / status 等不希望在 Resolve 里闪黑框的操作。
+function subfix_execute_hidden(utf8_command)
+    if not SUBFIX_IS_WINDOWS or not SUBFIX_WIN_FFI then
+        return os.execute(utf8_command)
+    end
+    local bat_path = subfix_temp_root() .. "/subfix_exec_" .. tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999)) .. ".bat"
+    local content = "chcp 65001 >nul\r\n" .. tostring(utf8_command) .. "\r\n"
+    if not subfix_write_file_w(bat_path, content) then
+        return os.execute(utf8_command)
+    end
+    local wcmd = subfix_utf8_to_wide('cmd.exe /c "' .. bat_path .. '"')
+    if not wcmd then
+        subfix_remove_files(bat_path)
+        return os.execute(utf8_command)
+    end
+    local si = SUBFIX_FFI.new("STARTUPINFOW")
+    si.cb = SUBFIX_FFI.sizeof(si)
+    local pi = SUBFIX_FFI.new("PROCESS_INFORMATION")
+    -- CREATE_NO_WINDOW = 0x08000000
+    local ok = SUBFIX_FFI.C.CreateProcessW(nil, wcmd, nil, nil, 0, 0x08000000, nil, nil, si, pi)
+    if ok == 0 then
+        subfix_remove_files(bat_path)
+        return os.execute(utf8_command)
+    end
+    -- INFINITE = 0xFFFFFFFF：同步等待进程结束（与 os.execute 一致）
+    SUBFIX_FFI.C.WaitForSingleObject(pi.hProcess, 0xFFFFFFFF)
+    local exit_code = SUBFIX_FFI.new("unsigned long[1]")
+    SUBFIX_FFI.C.GetExitCodeProcess(pi.hProcess, exit_code)
+    local code = tonumber(exit_code[0])
+    SUBFIX_FFI.C.CloseHandle(pi.hProcess)
+    SUBFIX_FFI.C.CloseHandle(pi.hThread)
+    subfix_remove_files(bat_path)
+    return code
+end
+
 function subfix_home_dir()
     if SUBFIX_WIN_FFI then
         return subfix_env_w("USERPROFILE") or os.getenv("HOME") or os.getenv("USERPROFILE") or ""
@@ -189,7 +230,7 @@ function subfix_sleep(seconds)
     local ok = pcall(function() bmd.wait(tonumber(seconds) or 0.1) end)
     if ok then return end
     if SUBFIX_IS_WINDOWS then
-        os.execute("ping -n 2 127.0.0.1 >nul")
+        subfix_execute_hidden("ping -n 2 127.0.0.1 >nul")
     else
         os.execute(string.format("sleep %.2f", tonumber(seconds) or 0.1))
     end
@@ -206,7 +247,7 @@ function subfix_ensure_dir(path)
         os.execute("mkdir -p '" .. s:gsub("'", "'\\''") .. "' 2>/dev/null")
         return true
     end
-    os.execute('mkdir "' .. subfix_cmd_path(path) .. '" 2>nul')
+    subfix_execute_hidden('mkdir "' .. subfix_cmd_path(path) .. '" 2>nul')
     -- ponytail: Lua 5.1 的 io/os 走 ANSI(GBK) API，而 UI 输入的路径是 UTF-8 字节，
     -- 含中文时 cmd 会误读导致建目录失败；此处探测并在失败时明确提示。
     -- 彻底解法是 LuaJIT FFI 调 CreateDirectoryW，待确认 Resolve 内嵌 LuaJIT 版本后升级。
@@ -235,7 +276,7 @@ function subfix_kill_tree(pid)
     pid = tonumber(pid)
     if not pid or pid <= 0 then return end
     if SUBFIX_IS_WINDOWS then
-        os.execute(string.format("taskkill /PID %d /T /F >nul 2>&1", pid))
+        subfix_execute_hidden(string.format("taskkill /PID %d /T /F >nul 2>&1", pid))
     else
         os.execute(string.format("pkill -P %d 2>/dev/null; kill -9 %d 2>/dev/null", pid, pid))
     end
@@ -309,7 +350,7 @@ function subfix_launch_bg_batch(batch_file, pid_file)
         local short = subfix_native_short_path(batch_file)
         if short then batch_file = short end
     end
-    os.execute('start "SubFixBG" /b cmd /c "' .. subfix_cmd_path(batch_file) .. '"')
+    subfix_execute_hidden('start "SubFixBG" /b cmd /c "' .. subfix_cmd_path(batch_file) .. '"')
 end
 
 SUBFIX_VERSION = "3.5.0"
@@ -22238,7 +22279,7 @@ function win.On.CleanBtn.Clicked(ev)
 
     if current_backup_path and current_backup_path ~= "" then
         if package.config:sub(1,1) == "\\" then
-            os.execute('del /Q /F "' .. current_backup_path .. '\\*.srt" 2>nul')
+            subfix_execute_hidden('del /Q /F "' .. current_backup_path .. '\\*.srt" 2>nul')
         else
             os.execute('rm -f "' .. current_backup_path .. '"/*.srt')
         end

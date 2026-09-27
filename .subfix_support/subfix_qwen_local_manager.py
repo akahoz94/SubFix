@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -31,6 +32,9 @@ PYPI_INDEX_FALLBACKS = (
     "https://pypi.org/simple",
 )
 MODEL_DOWNLOAD_SOURCES = (("modelscope", "魔搭国内源"), ("huggingface", "Hugging Face 备用源"))
+# PyTorch 官方 CUDA 索引：PyPI 与国内镜像的 torch 是 CPU 构建（+cpu），
+# RTX 等 NVIDIA 显卡上推理慢 10~30 倍；有 GPU 时 torch 必须从这里装。
+TORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu129"
 QWEN_ASR_REQUIRED_MODEL_FILES = (
     "config.json",
     "model.safetensors.index.json",
@@ -406,6 +410,49 @@ def pip_install_with_index_fallback(env_python: Path, packages: list[str], error
         + "；".join(errors))
 
 
+def _has_nvidia_gpu() -> bool:
+    """检测是否存在可用的 NVIDIA GPU（nvidia-smi 可执行且能列出设备）。"""
+    if os.name != "nt":
+        return False
+    candidates = [shutil.which("nvidia-smi"), r"C:\Windows\System32\nvidia-smi.exe"]
+    for nv in candidates:
+        if nv and os.path.isfile(nv):
+            try:
+                probe = subprocess.run([nv, "-L"], capture_output=True, timeout=20, check=False)
+                return probe.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+    return False
+
+
+def install_torch_with_cuda(env_python: Path, report: ProgressReporter, log_path: Path) -> None:
+    """从 PyTorch 官方 CUDA 索引安装支持 GPU 的 torch。
+
+    PyPI 与国内镜像的 torch 是 CPU 构建（+cpu），在 NVIDIA 显卡上推理慢 10~30 倍；
+    有 GPU 时优先走官方 cu 索引。失败回退镜像 CPU 版（功能可用，只是慢）。"""
+    command = [str(env_python), "-m", "pip", "install", "--upgrade",
+               "--index-url", TORCH_CUDA_INDEX_URL,
+               "--extra-index-url", PYPI_INDEX_FALLBACKS[0],
+               "--timeout", "60", "--retries", "5", "--disable-pip-version-check",
+               "--no-input", "--progress-bar", "off",
+               "--force-reinstall", "--no-deps", "torch"]
+    try:
+        run_checked(command, error_prefix="安装 GPU 版 PyTorch 失败",
+                    log_path=log_path, report=report,
+                    heartbeat=("安装依赖", "正在安装 GPU 版 PyTorch（CUDA），识别将大幅加速"))
+        return
+    except RuntimeError:
+        pass
+    # 兜底：torch 依赖已装（qwen-asr 要求），直接镜像装 CPU 版保持功能可用
+    pip_install_with_index_fallback(
+        env_python, ["torch"],
+        error_prefix="安装 PyTorch 失败（GPU 版不可用，已回退 CPU 版）",
+        report=report, log_path=log_path,
+        heartbeat=("安装依赖", "正在安装 PyTorch（CPU 版兜底，未检测到可用 GPU 源）"),
+        extra_args=["--resume-retries", "5"],
+    )
+
+
 def install_qwen_dependencies(env_python: Path, report: ProgressReporter, log_path: Path) -> None:
     # venv seeds pip 25.0.1; upgrading in the dependency command leaves that
     # same old process handling large downloads without resume support.
@@ -416,8 +463,14 @@ def install_qwen_dependencies(env_python: Path, report: ProgressReporter, log_pa
         log_path=log_path,
         heartbeat=("准备下载工具", "正在升级 pip，启用下载中断恢复"),
     )
+    has_gpu = _has_nvidia_gpu()
+    if has_gpu:
+        install_torch_with_cuda(env_python, report, log_path)
+        packages = ["qwen-asr", "huggingface_hub", "modelscope", "onnxruntime"]
+    else:
+        packages = ["qwen-asr", "torch", "huggingface_hub", "modelscope", "onnxruntime"]
     pip_install_with_index_fallback(
-        env_python, ["qwen-asr", "torch", "huggingface_hub", "modelscope", "onnxruntime"],
+        env_python, packages,
         error_prefix="安装本地 Qwen 依赖失败",
         report=report,
         log_path=log_path,
