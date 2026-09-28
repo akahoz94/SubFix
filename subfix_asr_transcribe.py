@@ -5487,6 +5487,16 @@ def run_generate_subtitles_batch_plan_v4(
             progress_total=100,
         )
         raw_payloads: list[dict[str, Any]] = []
+        # Qwen3-ASR 模型在首窗口转写时才懒加载（约 1-2 分钟），期间进度停在 25%
+        # 会被误认为卡死：这里提前预热模型，并用 indeterminate 进度明确告知加载中。
+        if not uses_doubao_backend:
+            write_progress(
+                progress_path,
+                "加载模型",
+                "正在加载 Qwen3-ASR 模型（约 1-2 分钟）",
+                indeterminate=True,
+            )
+            load_qwen3_asr_model(os.getenv("SUBFIX_QWEN3_ASR_MODEL") or QWEN3_ASR_MODEL)
         batch_size = qwen_generate_batch_size()
         for offset in range(0, len(windows), batch_size):
             chunk = windows[offset:offset + batch_size]

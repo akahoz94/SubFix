@@ -3843,7 +3843,7 @@ local function run_background_command_with_progress(cmd, progress_path, progress
 
         local display_message = tostring(payload and payload.message or "正在识别音频...")
         local stalled_seconds = math.max(0, os.time() - last_progress_changed_at)
-        if stalled_seconds >= GENERATE_PROGRESS_STALL_WARNING_SECONDS then
+        if not (payload and payload.indeterminate) and stalled_seconds >= GENERATE_PROGRESS_STALL_WARNING_SECONDS then
             display_message = display_message .. " · 长时间无新进度，可取消后重试"
             if not stall_warning_logged then
                 print(string.format(
