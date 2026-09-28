@@ -3207,15 +3207,14 @@ def percentile(values: list[float], ratio: float) -> float:
 def decode_pcm_samples(raw: bytes, sample_width: int, channels: int) -> list[float]:
     if sample_width != 2:
         raise RuntimeError(f"unsupported wav sample width: {sample_width}")
-    step = sample_width * channels
-    samples = []
-    for offset in range(0, len(raw) - step + 1, step):
-        channel_values = [
-            int.from_bytes(raw[offset + channel * sample_width : offset + (channel + 1) * sample_width], "little", signed=True)
-            for channel in range(channels)
-        ]
-        samples.append(sum(channel_values) / (len(channel_values) * 32768.0))
-    return samples
+    import numpy as _np
+    raw_arr = _np.frombuffer(raw, dtype=_np.int16)
+    usable = len(raw_arr) // channels * channels
+    if channels > 1:
+        mono = _np.mean(raw_arr[:usable].reshape(-1, channels).astype(_np.float64), axis=1) / 32768.0
+    else:
+        mono = raw_arr[:usable].astype(_np.float64) / 32768.0
+    return mono.tolist()
 
 
 def read_wav_mono_samples(wav_path: Path) -> tuple[list[float], int]:
@@ -3585,16 +3584,42 @@ def detect_speech_regions(
         sample_width = handle.getsampwidth()
         raw = handle.readframes(handle.getnframes())
 
-    samples = decode_pcm_samples(raw, sample_width, channels)
+    import numpy as _np
+    _raw_arr = _np.frombuffer(raw, dtype=_np.int16)
+    _usable = len(_raw_arr) // channels * channels
+    if channels > 1:
+        samples = _np.mean(_raw_arr[:_usable].reshape(-1, channels).astype(_np.float64), axis=1) / 32768.0
+    else:
+        samples = _raw_arr[:_usable].astype(_np.float64) / 32768.0
     window_size = max(1, int(sample_rate * window_seconds))
+    arr = samples
+    total = len(arr)
+    full_windows = total // window_size
     windows: list[dict[str, float]] = []
-    for start in range(0, len(samples), window_size):
-        chunk = samples[start : start + window_size]
-        if not chunk:
-            continue
-        rms = math.sqrt(sum(sample * sample for sample in chunk) / len(chunk))
-        peak = max(abs(sample) for sample in chunk)
-        windows.append({"start": start / sample_rate, "end": min(len(samples), start + len(chunk)) / sample_rate, "rms": rms, "peak": peak})
+    if full_windows > 0:
+        trimmed = arr[: full_windows * window_size].reshape(full_windows, window_size)
+        rms_values = _np.sqrt(_np.mean(trimmed * trimmed, axis=1))
+        peak_values = _np.max(_np.abs(trimmed), axis=1)
+        windows.extend(
+            {
+                "start": index * window_size / sample_rate,
+                "end": min(total, (index + 1) * window_size) / sample_rate,
+                "rms": float(rms_values[index]),
+                "peak": float(peak_values[index]),
+            }
+            for index in range(full_windows)
+        )
+    tail_start = full_windows * window_size
+    if tail_start < total:
+        tail = arr[tail_start:]
+        windows.append(
+            {
+                "start": tail_start / sample_rate,
+                "end": total / sample_rate,
+                "rms": float(_np.sqrt(_np.mean(tail * tail))),
+                "peak": float(_np.max(_np.abs(tail))),
+            }
+        )
 
     rms_values = [window["rms"] for window in windows]
     peak_values = [window["peak"] for window in windows]
@@ -5323,6 +5348,7 @@ def run_generate_subtitles_batch_plan_v4(
     progress_path: Path | None,
     fixture_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    _stage_t0 = time.monotonic()
     requested_engine = str(getattr(args, "generate_engine", "v4") or "v4").lower()
     v5_mode = requested_engine == "v5"
     engine_label = "v5" if v5_mode else "v4"
@@ -5475,6 +5501,7 @@ def run_generate_subtitles_batch_plan_v4(
             for track in prepared_tracks
             for window in track.get("windows") or []
         ]
+        _stage_prepare = time.monotonic()
         if not windows:
             raise RuntimeError(f"{engine_label} 未生成连续音轨窗口")
         write_progress(
@@ -5700,6 +5727,7 @@ def run_generate_subtitles_batch_plan_v4(
         align_language = qwen3_language_name(args.language) or "Chinese"
         backend = "qwen3_asr"
         model = args.model
+        _stage_asr = time.monotonic()
         alignment_retry_regions: list[dict[str, Any]] = []
         for align_index, (window, raw_payload) in enumerate(zip(windows, raw_payloads), start=1):
             has_doubao_words = (
@@ -5798,6 +5826,7 @@ def run_generate_subtitles_batch_plan_v4(
                 if context_retry and adjacent_window is not None
                 else int(window["start_frame"])
             )
+            _stage_align = time.monotonic()
             aligned_units = generate_v4.score_aligned_units_from_audio(
                 score_audio_path,
                 aligned_units,
@@ -6232,6 +6261,13 @@ def run_generate_subtitles_batch_plan_v4(
                 }
             )
         diagnostic["stages"]["segmentation"] = segmentation_stage
+        diagnostic["stage_elapsed_seconds"] = {
+            "prepare": round(_stage_prepare - _stage_t0, 3),
+            "asr": round(_stage_asr - _stage_prepare, 3),
+            "align": round(_stage_align - _stage_asr, 3),
+            "postprocess": round(time.monotonic() - _stage_align, 3),
+            "total": round(time.monotonic() - _stage_t0, 3),
+        }
         diagnostic["canonical_unit_count"] = len(canonical_units)
         diagnostic["generated_subtitle_count"] = len(subtitle_rows)
         diagnostic["forced_aligned_unit_coverage"] = 1.0 if canonical_units else 0.0

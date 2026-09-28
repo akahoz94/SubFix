@@ -12,6 +12,7 @@ import re
 import statistics
 import wave
 from array import array
+import numpy as _np
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable
@@ -485,11 +486,15 @@ def score_aligned_units_from_audio(
 ) -> list[dict[str, Any]]:
     sample_rate, samples = _read_mono_pcm16(Path(audio_path))
     rms_window = max(1, int(round(sample_rate * 0.01)))
-    window_levels = sorted(
-        _rms(array("h", samples[index:index + rms_window]))
-        for index in range(0, len(samples), rms_window)
-        if samples[index:index + rms_window]
-    )
+    arr = _np.asarray(samples, dtype=_np.float64)
+    full_windows = len(arr) // rms_window
+    window_levels: list[float] = []
+    if full_windows > 0:
+        trimmed = arr[: full_windows * rms_window].reshape(full_windows, rms_window)
+        window_levels = sorted(_np.sqrt(_np.mean(trimmed * trimmed, axis=1)).tolist())
+    tail_arr = arr[full_windows * rms_window:]
+    if tail_arr.size:
+        window_levels.append(float(_np.sqrt(_np.mean(tail_arr * tail_arr))))
     noise_floor = window_levels[min(len(window_levels) - 1, int(len(window_levels) * 0.20))] if window_levels else 0.0
     noise_floor = max(1.0, noise_floor)
     scored: list[dict[str, Any]] = []
@@ -499,7 +504,8 @@ def score_aligned_units_from_audio(
         end_frame = max(start_frame + 1, int(unit.get("end_frame") or start_frame + 1))
         start_sample = max(0, int(round((start_frame - window_start_frame) / fps * sample_rate)))
         end_sample = min(len(samples), max(start_sample + 1, int(round((end_frame - window_start_frame) / fps * sample_rate))))
-        unit_level = _rms(array("h", samples[start_sample:end_sample]))
+        unit_seg = arr[start_sample:end_sample]
+        unit_level = float(_np.sqrt(_np.mean(unit_seg * unit_seg))) if unit_seg.size else 0.0
         snr_db = max(-20.0, min(60.0, 20.0 * math.log10(max(1.0, unit_level) / noise_floor)))
         unit["speaker_score_db"] = round(snr_db, 3)
         unit["source_score"] = round(float(alignment_coverage) * 6.0 + max(0.0, snr_db) * 0.5, 3)
