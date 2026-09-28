@@ -490,12 +490,16 @@ def _read_pcm16(path: str | Path) -> tuple[int, array]:
 
 
 def _window_rms(samples: array, size: int) -> list[float]:
+    import numpy as _np
+    arr = _np.asarray(samples, dtype=_np.float64)
+    full = len(arr) // size
     levels: list[float] = []
-    for index in range(0, len(samples), size):
-        chunk = samples[index:index + size]
-        if not chunk:
-            continue
-        levels.append(math.sqrt(sum(float(value) * float(value) for value in chunk) / len(chunk)))
+    if full > 0:
+        trimmed = arr[: full * size].reshape(full, size)
+        levels = _np.sqrt(_np.mean(trimmed * trimmed, axis=1)).tolist()
+    tail = arr[full * size:]
+    if tail.size:
+        levels.append(float(_np.sqrt(_np.mean(tail * tail))))
     return levels
 
 

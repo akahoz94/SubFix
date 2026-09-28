@@ -475,7 +475,7 @@ def install_qwen_dependencies(env_python: Path, report: ProgressReporter, log_pa
         # 先装公共依赖（qwen-asr 会带上 torch 所需的 sympy/jinja2 等），
         # 再单独从 cu129 索引装 GPU 版 torch——避免 --extra-index-url 引入 PyPI +cpu 版干扰。
         pip_install_with_index_fallback(
-            env_python, ["qwen-asr", "huggingface_hub", "modelscope", "onnxruntime"],
+            env_python, ["qwen-asr", "huggingface_hub", "modelscope", "onnxruntime", "pypinyin"],
             error_prefix="安装本地 Qwen 依赖失败",
             report=report,
             log_path=log_path,
@@ -485,7 +485,7 @@ def install_qwen_dependencies(env_python: Path, report: ProgressReporter, log_pa
         install_torch_with_cuda(env_python, report, log_path)
         return
     pip_install_with_index_fallback(
-        env_python, ["qwen-asr", "torch", "huggingface_hub", "modelscope", "onnxruntime"],
+        env_python, ["qwen-asr", "torch", "huggingface_hub", "modelscope", "onnxruntime", "pypinyin"],
         error_prefix="安装本地 Qwen 依赖失败",
         report=report,
         log_path=log_path,

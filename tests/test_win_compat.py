@@ -69,8 +69,12 @@ _shutil.rmtree(ensure_target.parent.parent, ignore_errors=True)
 g.subfix_ensure_dir(str(ensure_target))
 check("subfix_ensure_dir 真实创建多级目录(FFI)", ensure_target.is_dir())
 
-# subfix_kill_tree 应发 taskkill
+# subfix_kill_tree 应发 taskkill /T /F。FFI 下走隐藏执行（bat 中转 + CreateProcessW），
+# 不经过 os.execute；临时关掉 FFI 走产品自身的 os.execute 兜底路径，拦截命令串验证。
+ffi_flag = g.SUBFIX_WIN_FFI
+g.SUBFIX_WIN_FFI = False
 g.subfix_kill_tree(4321)
+g.SUBFIX_WIN_FFI = ffi_flag
 lines = [str(v) for v in g.EXECUTED.values()]
 check("subfix_kill_tree 用 taskkill /T /F", any("taskkill /PID 4321 /T /F" in ln for ln in lines), str(lines[-1:]))
 

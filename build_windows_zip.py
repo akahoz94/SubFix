@@ -26,6 +26,7 @@ ROOT_PY = [
     "subfix_generate_v5.py",
     "subfix_generate_textnorm.py",
     "subfix_silero_vad.py",
+    "subfix_script_proofread.py",
 ]
 SUPPORT_FILES = [
     "subfix_generate_selection_core.lua",

@@ -12,21 +12,32 @@ def make_paths(manager, root):
     return manager.SubFixQwenPaths(root, data_root=root / "subfix-user-data")
 
 
-def test_dependency_commands_use_domestic_index_and_keep_resume_support(tmp_path, monkeypatch):
+@pytest.mark.parametrize("has_gpu", [False, True])
+def test_dependency_commands_use_domestic_index_and_keep_resume_support(tmp_path, monkeypatch, has_gpu):
     manager = load_manager_module()
     commands = []
+    monkeypatch.setattr(manager, "_has_nvidia_gpu", lambda: has_gpu)
     monkeypatch.setattr(manager, "run_checked", lambda command, **kwargs: commands.append(command))
 
     manager.install_qwen_dependencies(Path("python"), lambda *_: None, tmp_path / "install.log")
 
-    assert len(commands) == 2
-    for command in commands:
-        assert command[command.index("--index-url") + 1] == "https://pypi.tuna.tsinghua.edu.cn/simple"
+    # 有 N 卡时 torch 单独走 PyTorch 官方 cu129 索引（第 3 条命令），其余走镜像回退链
+    gpu_torch_index = 2 if has_gpu else -1
+    assert len(commands) == (3 if has_gpu else 2)
+    for position, command in enumerate(commands):
+        expected_index = ("https://download.pytorch.org/whl/cu129" if position == gpu_torch_index
+                          else "https://pypi.tuna.tsinghua.edu.cn/simple")
+        assert command[command.index("--index-url") + 1] == expected_index
         assert "--trusted-host" not in command
         assert "config" not in command
     assert "pip>=25.2" in commands[0]
     assert "--resume-retries" in commands[1]
     assert "modelscope" in commands[1]
+    if has_gpu:
+        assert "torch" not in commands[1]
+        assert "torch" in commands[2] and "--force-reinstall" in commands[2]
+    else:
+        assert "torch" in commands[1]
 
 
 @pytest.mark.parametrize("already_installed", [False, True])

@@ -44,6 +44,8 @@ if SUBFIX_IS_WINDOWS then
     if ffi_ok and ffi_mod and ffi_mod.os == "Windows" then
         SUBFIX_WIN_FFI = true
         SUBFIX_FFI = ffi_mod
+        local ok_user32, user32_mod = pcall(function() return ffi_mod.load("user32") end)
+        if ok_user32 then SUBFIX_USER32 = user32_mod end
         ffi_mod.cdef[[
             int MultiByteToWideChar(unsigned int CodePage, unsigned long dwFlags, const char *lpMultiByteStr, int cbMultiByte, wchar_t *lpWideCharStr, int cchWideChar);
             int WideCharToMultiByte(unsigned int CodePage, unsigned long dwFlags, const wchar_t *lpWideCharStr, int cchWideChar, char *lpMultiByteStr, int cbMultiByte, const char *lpDefaultChar, int *lpUsedDefaultChar);
@@ -64,6 +66,7 @@ if SUBFIX_IS_WINDOWS then
             int GetExitCodeProcess(void *hProcess, unsigned long *lpExitCode);
             typedef struct { DWORD cb; wchar_t *lpReserved; wchar_t *lpDesktop; wchar_t *lpTitle; DWORD dwX; DWORD dwY; DWORD dwXSize; DWORD dwYSize; DWORD dwXCountChars; DWORD dwYCountChars; DWORD dwFillAttribute; DWORD dwFlags; unsigned short wShowWindow; unsigned short cbReserved2; unsigned char *lpReserved2; void *hStdInput; void *hStdOutput; void *hStdError; } STARTUPINFOW;
             typedef struct { void *hProcess; void *hThread; DWORD dwProcessId; DWORD dwThreadId; } PROCESS_INFORMATION;
+            int GetSystemMetrics(int nIndex);
         ]]
         local CP_UTF8 = 65001
         local INVALID_ATTR = 0xFFFFFFFF
@@ -371,14 +374,13 @@ function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
     if not (io and io.popen) then return nil end
 
     if SUBFIX_IS_WINDOWS then
-        -- ponytail: 用虚拟屏幕近似 mac 端“与 Resolve 主窗重叠最大的屏”；
-        -- 多显示器精确定位可升级为 EnumDisplayMonitors + MonitorFromWindow。
-        local pipe = io.popen('powershell -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; \\"$($b.X),$($b.Y),$($b.Width),$($b.Height)\\"" 2>nul', "r")
-        if pipe then
-            local output = pipe:read("*a") or ""
-            pipe:close()
-            local x, y, width, height = output:match("^%s*([%-%.%d]+),([%-%.%d]+),([%-%.%d]+),([%-%.%d]+)%s*$")
-            x, y, width, height = tonumber(x), tonumber(y), tonumber(width), tonumber(height)
+        -- user32 GetSystemMetrics 直接取虚拟屏幕，无需 powershell（消除黑框）。
+        -- SM_XVIRTUALSCREEN=76 SM_YVIRTUALSCREEN=77 SM_CXVIRTUALSCREEN=78 SM_CYVIRTUALSCREEN=79
+        if SUBFIX_USER32 then
+            local x = tonumber(SUBFIX_USER32.GetSystemMetrics(76))
+            local y = tonumber(SUBFIX_USER32.GetSystemMetrics(77))
+            local width = tonumber(SUBFIX_USER32.GetSystemMetrics(78))
+            local height = tonumber(SUBFIX_USER32.GetSystemMetrics(79))
             if x and y and width and height and width > 0 and height > 0 then
                 return {x = x, y = y, width = width, height = height}
             end
@@ -778,14 +780,24 @@ local function resolve_worker_python(paths)
     if not SUBFIX_IS_WINDOWS then
         return nil
     end
-    for _, probe in ipairs({ "py -3 -c \"import sys;print(sys.executable)\"", "python -c \"import sys;print(sys.executable)\"" }) do
-        local handle = io.popen(probe .. " 2>nul")
-        if handle then
-            local output = (handle:read("*a") or ""):gsub("[\r\n]", "")
-            handle:close()
-            if output ~= "" and file_exists(output) then
-                return output
-            end
+    -- 不启动 py/python 子进程（弹黑框）：按常见安装位置直接探测（英文路径，ANSI 安全）。
+    local appdata = subfix_env_w and subfix_env_w("APPDATA")
+    local localappdata = subfix_env_w and subfix_env_w("LOCALAPPDATA")
+    local candidates = {}
+    if appdata then
+        candidates[#candidates + 1] = appdata .. [[\SubFix\envs\qwen-local\Scripts\python.exe]]
+    end
+    if localappdata then
+        for _, ver in ipairs({ "314", "313", "312", "311", "310" }) do
+            candidates[#candidates + 1] = localappdata .. [[\Programs\Python\Python]] .. ver .. [[\python.exe]]
+        end
+    end
+    for _, ver in ipairs({ "314", "313", "312", "311", "310" }) do
+        candidates[#candidates + 1] = [[C:\Python]] .. ver .. [[\python.exe]]
+    end
+    for _, candidate in ipairs(candidates) do
+        if file_exists(candidate) then
+            return candidate
         end
     end
     return nil
@@ -3739,6 +3751,12 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     if hotwords_json and file_exists(hotwords_json) then
         cmd_parts[#cmd_parts + 1] = "--hotwords-json"
         cmd_parts[#cmd_parts + 1] = shell_quote(hotwords_json)
+    end
+    -- 文稿校对：同音错别字/标点跟文稿写法，结构差异保转录，文稿内容绝不新增进字幕
+    local script_file_path = tostring(runtime_options and runtime_options.script_file_path or "")
+    if script_file_path ~= "" and file_exists(script_file_path) then
+        cmd_parts[#cmd_parts + 1] = "--script-file"
+        cmd_parts[#cmd_parts + 1] = shell_quote(script_file_path)
     end
     return table.concat(cmd_parts, " "), nil, env_pairs
 end

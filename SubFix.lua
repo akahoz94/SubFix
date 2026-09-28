@@ -38,6 +38,8 @@ if SUBFIX_IS_WINDOWS then
     if ffi_ok and ffi_mod and ffi_mod.os == "Windows" then
         SUBFIX_WIN_FFI = true
         SUBFIX_FFI = ffi_mod
+        local ok_user32, user32_mod = pcall(function() return ffi_mod.load("user32") end)
+        if ok_user32 then SUBFIX_USER32 = user32_mod end
         ffi_mod.cdef[[
             int MultiByteToWideChar(unsigned int CodePage, unsigned long dwFlags, const char *lpMultiByteStr, int cbMultiByte, wchar_t *lpWideCharStr, int cchWideChar);
             int WideCharToMultiByte(unsigned int CodePage, unsigned long dwFlags, const wchar_t *lpWideCharStr, int cchWideChar, char *lpMultiByteStr, int cbMultiByte, const char *lpDefaultChar, int *lpUsedDefaultChar);
@@ -58,6 +60,7 @@ if SUBFIX_IS_WINDOWS then
             int GetExitCodeProcess(void *hProcess, unsigned long *lpExitCode);
             typedef struct { DWORD cb; wchar_t *lpReserved; wchar_t *lpDesktop; wchar_t *lpTitle; DWORD dwX; DWORD dwY; DWORD dwXSize; DWORD dwYSize; DWORD dwXCountChars; DWORD dwYCountChars; DWORD dwFillAttribute; DWORD dwFlags; unsigned short wShowWindow; unsigned short cbReserved2; unsigned char *lpReserved2; void *hStdInput; void *hStdOutput; void *hStdError; } STARTUPINFOW;
             typedef struct { void *hProcess; void *hThread; DWORD dwProcessId; DWORD dwThreadId; } PROCESS_INFORMATION;
+            int GetSystemMetrics(int nIndex);
         ]]
         local CP_UTF8 = 65001
         local INVALID_ATTR = 0xFFFFFFFF
@@ -353,7 +356,7 @@ function subfix_launch_bg_batch(batch_file, pid_file)
     subfix_execute_hidden('start "SubFixBG" /b cmd /c "' .. subfix_cmd_path(batch_file) .. '"')
 end
 
-SUBFIX_VERSION = "3.5.0"
+SUBFIX_VERSION = "3.6.0"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -374,14 +377,13 @@ function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
     if not (io and io.popen) then return nil end
 
     if SUBFIX_IS_WINDOWS then
-        -- ponytail: 用虚拟屏幕近似 mac 端“与 Resolve 主窗重叠最大的屏”；
-        -- 多显示器精确定位可升级为 EnumDisplayMonitors + MonitorFromWindow。
-        local pipe = io.popen('powershell -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; \\"$($b.X),$($b.Y),$($b.Width),$($b.Height)\\"" 2>nul', "r")
-        if pipe then
-            local output = pipe:read("*a") or ""
-            pipe:close()
-            local x, y, width, height = output:match("^%s*([%-%.%d]+),([%-%.%d]+),([%-%.%d]+),([%-%.%d]+)%s*$")
-            x, y, width, height = tonumber(x), tonumber(y), tonumber(width), tonumber(height)
+        -- user32 GetSystemMetrics 直接取虚拟屏幕，无需 powershell（消除黑框）。
+        -- SM_XVIRTUALSCREEN=76 SM_YVIRTUALSCREEN=77 SM_CXVIRTUALSCREEN=78 SM_CYVIRTUALSCREEN=79
+        if SUBFIX_USER32 then
+            local x = tonumber(SUBFIX_USER32.GetSystemMetrics(76))
+            local y = tonumber(SUBFIX_USER32.GetSystemMetrics(77))
+            local width = tonumber(SUBFIX_USER32.GetSystemMetrics(78))
+            local height = tonumber(SUBFIX_USER32.GetSystemMetrics(79))
             if x and y and width and height and width > 0 and height > 0 then
                 return {x = x, y = y, width = width, height = height}
             end
@@ -13247,6 +13249,24 @@ function load_generate_selection_core_for_subfix()
     return core_or_err, nil, script_root
 end
 
+-- 文稿校对：把用户文稿写成 UTF-8 临时文件（Lua 字符串即字节流，不做任何转码），失败返回 nil
+local function write_reference_script_temp_file(script_text)
+    local base_dir = current_backup_path ~= "" and current_backup_path or "/tmp"
+    local uid = tostring(os.time()) .. "_" .. tostring(math.floor(os.clock() * 1000))
+    local path = base_dir .. "/SubFix_Script_" .. uid .. ".txt"
+    ensure_backup_directory()
+    if SUBFIX_IS_WINDOWS and subfix_write_file_w then
+        -- Windows 下 io.open 走 ANSI，中文路径必败，用 CreateFileW 写
+        if subfix_write_file_w(path, script_text) then return path end
+        return nil
+    end
+    local file = io.open(path, "wb")
+    if not file then return nil end
+    file:write(script_text)
+    file:close()
+    return path
+end
+
 function run_generate_selection_subtitles_from_subfix(target_window)
     local window = resolve_window(target_window)
     update_shared_status(window, "正在生成选区字幕...")
@@ -13257,10 +13277,19 @@ function run_generate_selection_subtitles_from_subfix(target_window)
         return false
     end
 
+    -- 文稿校对：非空文稿落成 UTF-8 临时文件经 --script-file 传给 ASR helper；空文稿保持原有行为
+    local script_file_path = nil
+    local script_text = sanitize_reference_script_text(read_shared_config_from_ui().script_content)
+    if script_text ~= "" then
+        script_file_path = write_reference_script_temp_file(script_text)
+    end
+
     local ok, run_err = core.run({
         script_root = script_root,
-        target_subtitle_track = 1
+        target_subtitle_track = 1,
+        script_file_path = script_file_path
     })
+    if script_file_path then subfix_remove_files(script_file_path) end
     if not ok then
         local message = tostring(run_err or "生成选区字幕失败")
         if message:find("已取消", 1, true) then

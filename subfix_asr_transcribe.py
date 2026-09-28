@@ -82,6 +82,30 @@ class _LazyGenerateV5:
 generate_v5 = _LazyGenerateV5()
 
 
+class _LazyScriptProofread:
+    _module: Any = None
+
+    def _load(self) -> Any:
+        if self._module is not None:
+            return self._module
+        module_path = Path(__file__).resolve().with_name("subfix_script_proofread.py")
+        if not module_path.is_file():
+            raise RuntimeError(f"文稿校对模块缺失: {module_path.name}")
+        spec = importlib.util.spec_from_file_location("subfix_script_proofread", module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("文稿校对模块无法加载")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self._module = module
+        return module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+script_proofread = _LazyScriptProofread()
+
+
 class _LazyGenerateTextnorm:
     _module: Any = None
 
@@ -578,7 +602,12 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
     }
 
 
+_PROGRESS_STAGE_TIMES: dict[str, float] = {}
+
+
 def write_progress(path: Path | None, stage: str, message: str, **extra: Any) -> None:
+    if stage and stage not in _PROGRESS_STAGE_TIMES:
+        _PROGRESS_STAGE_TIMES[stage] = time.monotonic()
     if not path:
         return
     payload = {
@@ -3900,14 +3929,32 @@ def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
     except Exception as exc:  # pragma: no cover - depends on optional local setup
         raise RuntimeError("Qwen3-ASR 环境未安装，请安装 qwen-asr 或继续使用 Whisper fallback") from exc
 
+    # 必须在 from_pretrained 占用显存之前完成首次空闲读数——模型加载后再读，
+    # PyTorch 缓存池会把驱动空闲压到 1GB 以下，批大小分档会永远落进保命档。
+    _read_free_gb_before_model_load()
+
+    chunk_seconds = os.getenv("SUBFIX_FORCE_ALIGN_CHUNK_SECONDS")
+    if chunk_seconds:
+        try:
+            _chunk_sec_value = float(chunk_seconds)
+            from qwen_asr.inference import utils as _qwen_qa_utils
+            _qwen_qa_utils.MAX_FORCE_ALIGN_INPUT_SECONDS = _chunk_sec_value
+            from qwen_asr.inference import qwen3_asr as _qwen3_asr_module
+            _qwen3_asr_module.MAX_FORCE_ALIGN_INPUT_SECONDS = _chunk_sec_value
+        except Exception:
+            pass
     model_name = os.getenv("SUBFIX_QWEN3_ASR_MODEL") or QWEN3_ASR_MODEL
     aligner_name = os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or QWEN3_FORCED_ALIGNER_MODEL
-    device_map = os.getenv("SUBFIX_QWEN3_ASR_DEVICE_MAP") or "auto"
+    device_map = os.getenv("SUBFIX_QWEN3_ASR_DEVICE_MAP")
+    if not device_map:
+        device_map = "cuda:0" if torch.cuda.is_available() else "auto"
     dtype = qwen3_torch_dtype(torch)
 
     init_kwargs: dict[str, Any] = {
         "device_map": device_map,
-        "max_inference_batch_size": int(os.getenv("SUBFIX_QWEN3_ASR_MAX_BATCH") or "8"),
+        # 初始占位值：模型加载后 _apply_auto_batch_size 按实时空闲显存覆盖；
+        # 手动 env 值在两处都生效。
+        "max_inference_batch_size": int(os.getenv("SUBFIX_QWEN3_ASR_MAX_BATCH") or "1"),
         "max_new_tokens": int(os.getenv("SUBFIX_QWEN3_ASR_MAX_NEW_TOKENS") or "512"),
         "forced_aligner": aligner_name,
         "forced_aligner_kwargs": {"device_map": device_map},
@@ -3937,7 +3984,9 @@ def load_qwen3_forced_aligner() -> Any:
         raise RuntimeError("Qwen3-ForcedAligner 环境未安装，请运行 setup_asr_env.sh") from exc
 
     model_name = os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or QWEN3_FORCED_ALIGNER_MODEL
-    device_map = os.getenv("SUBFIX_QWEN3_ASR_DEVICE_MAP") or "auto"
+    device_map = os.getenv("SUBFIX_QWEN3_ASR_DEVICE_MAP")
+    if not device_map:
+        device_map = "cuda:0" if torch.cuda.is_available() else "auto"
     dtype = qwen3_torch_dtype(torch)
     cache_key = (model_name, device_map, str(dtype))
     cached = _QWEN3_FORCED_ALIGNER_CACHE.get(cache_key)
@@ -4009,6 +4058,96 @@ def qwen3_result_to_payload(
     }
 
 
+_AUTO_BATCH_STATE: dict[str, Any] = {}
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    try:
+        import torch
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    return "out of memory" in str(exc).lower()
+
+
+def _read_free_gb_before_model_load() -> float | None:
+    """进程内首次调用时读取驱动空闲显存（模型尚未加载，读数即总预算）。
+
+    ponytail: 读数缓存在 _AUTO_BATCH_STATE，模型常驻后不再重估——长生命周期
+    下显存格局漂移由 OOM 减半兜底纠偏，升级路径是定期重估。
+    """
+    if "preload_free_gb" in _AUTO_BATCH_STATE:
+        return _AUTO_BATCH_STATE["preload_free_gb"]
+    value: float | None = None
+    try:
+        import torch
+        if torch.cuda.is_available():
+            value = torch.cuda.mem_get_info()[0] / 1024 ** 3
+    except Exception:
+        value = None
+    _AUTO_BATCH_STATE["preload_free_gb"] = value
+    return value
+
+
+def auto_inference_batch_size() -> int:
+    """按模型加载前的空闲显存选推理批大小。
+
+    8GB 卡实测（3060 Ti，模型+对齐器驻留约 6.4GB）：加载前空闲 6.8GB
+    （干净桌面）批 2 稳定且快——6.3 分钟音频 2m00s，RTF 0.32；空闲 3.2GB
+    （达芬奇等占 2.5GB）批 2 批内激活超限，触发驱动 sysmem fallback 掉速
+    14 倍（同素材 27m46s），批 1 为其保命档。批 4 档位留给加载前空闲
+    7.5GB 以上的大显存卡（12GB+）。
+    """
+    free_gb = _read_free_gb_before_model_load()
+    if free_gb is not None:
+        if free_gb >= 7.5:
+            return 4
+        if free_gb >= 6.0:
+            return 2
+    return 1
+
+
+def _apply_auto_batch_size(qwen_model: Any) -> None:
+    """决定本次推理批大小；优先级：手动 env > 会话内 OOM 教训 > 实时空闲分档。"""
+    env_value = os.getenv("SUBFIX_QWEN3_ASR_MAX_BATCH")
+    if env_value:
+        try:
+            qwen_model.max_inference_batch_size = max(1, int(env_value))
+            return
+        except ValueError:
+            pass
+    remembered = _AUTO_BATCH_STATE.get("value")
+    if remembered:
+        qwen_model.max_inference_batch_size = remembered
+        return
+    qwen_model.max_inference_batch_size = auto_inference_batch_size()
+
+
+def _transcribe_with_oom_retry(
+    qwen_model: Any, audio: str | list[str], language: str | None, context: str | None
+) -> tuple[Any, str]:
+    _apply_auto_batch_size(qwen_model)
+    try:
+        return _transcribe_qwen3_model(qwen_model, audio, language, context)
+    except Exception as exc:
+        current = int(getattr(qwen_model, "max_inference_batch_size", 1) or 1)
+        if current <= 1 or not _is_cuda_oom(exc):
+            raise
+        halved = max(1, current // 2)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        # 会话内记住降档结果：缓存模型对象属性天然跨调用生效，这里再记一份
+        # 防模型缓存键变化后重新加载时丢失教训。
+        _AUTO_BATCH_STATE["value"] = halved
+        qwen_model.max_inference_batch_size = halved
+        return _transcribe_qwen3_model(qwen_model, audio, language, context)
+
+
 def _transcribe_qwen3_model(
     qwen_model: Any, audio: str | list[str], language: str | None, context: str | None
 ) -> tuple[Any, str]:
@@ -4034,7 +4173,7 @@ def transcribe_qwen3_asr(
 ) -> dict[str, Any]:
     qwen_model, model_name, aligner_name, device_map = load_qwen3_asr_model(model)
     try:
-        results, hotword_context_status = _transcribe_qwen3_model(
+        results, hotword_context_status = _transcribe_with_oom_retry(
             qwen_model, str(audio_path), language, context
         )
     except Exception as exc:  # pragma: no cover - depends on optional local setup/model cache
@@ -4052,7 +4191,7 @@ def transcribe_qwen3_asr_batch(
         return []
     qwen_model, model_name, aligner_name, device_map = load_qwen3_asr_model(model)
     try:
-        results, hotword_context_status = _transcribe_qwen3_model(
+        results, hotword_context_status = _transcribe_with_oom_retry(
             qwen_model, [str(path) for path in audio_paths], language, context
         )
     except Exception as exc:  # pragma: no cover - depends on optional local setup/model cache
@@ -4660,13 +4799,17 @@ def should_try_qwen_batch_backend(backend: str) -> bool:
 
 
 def qwen_generate_batch_size() -> int:
+    # 与库内推理批同源自适应（auto_inference_batch_size，实测校准见其注释）：
+    # 干净 8GB 卡取 2，显存被达芬奇等挤占时自动降到 1。喂入批只决定多少个
+    # 窗文件一次传给库，真正的 generate 批由库内 max_inference_batch_size 决定，
+    # 两者不一致不影响正确性。
     raw_value = os.getenv("SUBFIX_QWEN_GENERATE_BATCH_SIZE")
     if raw_value:
         try:
             return max(1, int(raw_value))
         except ValueError:
             pass
-    return 8
+    return auto_inference_batch_size()
 
 
 def recover_v4_asr_window(
@@ -5540,6 +5683,13 @@ def run_generate_subtitles_batch_plan_v4(
                 [Path(window["audio_path"]) for window in chunk],
                 args,
             )
+            try:
+                # 批间回收推理激活与中间缓存，避免显存水位逐批爬高触发 sysmem fallback
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except Exception:
+                pass
             raw_payloads.extend(chunk_payloads)
             diagnostic["asr_backend_used"] = chunk_asr_diagnostic.get(
                 "asr_backend_used", diagnostic["asr_backend_used"]
@@ -6171,6 +6321,13 @@ def run_generate_subtitles_batch_plan_v4(
             float(args.fps or 30.0),
         )
         diagnostic["word_boundary_protected_count"] = word_boundary_protected_count
+        script_file_path = getattr(args, "script_file", None)
+        if script_file_path:
+            script_text = Path(str(script_file_path)).read_text(encoding="utf-8")
+            subtitle_rows, proofread_diagnostic = script_proofread.proofread_rows(
+                subtitle_rows, script_text
+            )
+            diagnostic.update(proofread_diagnostic)
         subtitle_rows, hard_char_split_count = generate_v4.enforce_hard_char_limit(
             subtitle_rows,
             canonical_units,
@@ -6302,6 +6459,12 @@ def run_generate_subtitles_batch_plan_v4(
         progress_index=95,
         progress_total=100,
     )
+    timeline: dict[str, float] = {}
+    prev_mark = _stage_t0
+    for stage_name in sorted(_PROGRESS_STAGE_TIMES, key=lambda key: _PROGRESS_STAGE_TIMES[key]):
+        timeline[stage_name] = round(_PROGRESS_STAGE_TIMES[stage_name] - prev_mark, 3)
+        prev_mark = _PROGRESS_STAGE_TIMES[stage_name]
+    diagnostic["progress_stage_elapsed_seconds"] = timeline
     return {
         "ok": True,
         "backend": backend,
@@ -7093,6 +7256,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fixture-json")
     parser.add_argument("--progress-json")
     parser.add_argument("--diagnostic-output")
+    parser.add_argument(
+        "--script-file",
+        help=(
+            "用户文稿文件（UTF-8）。提供时在断句前做文稿校对：同音别字/标点"
+            "差异采用文稿写法，结构差异保转录；文稿内容绝不新增进字幕。"
+        ),
+    )
     parser.add_argument(
         "--max-chars",
         type=int,
