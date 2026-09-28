@@ -19,8 +19,10 @@ from typing import Callable
 
 if os.name == "nt":
     import msvcrt
+    CREATE_NO_WINDOW = 0x08000000  # 隐藏子进程控制台窗口，杜绝黑框
 else:
     import fcntl
+    CREATE_NO_WINDOW = 0
 
 
 QWEN_ASR_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
@@ -147,6 +149,7 @@ def python_can_import_qwen_asr(python: Path) -> bool:
             stderr=subprocess.DEVNULL,
             # A fresh macOS environment can spend over a minute loading native libraries.
             timeout=180,
+            creationflags=CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -362,6 +365,7 @@ def run_checked(
             stderr=subprocess.STDOUT,
             text=True,
             errors="replace",
+            creationflags=CREATE_NO_WINDOW,
         )
     except OSError as exc:
         output = str(exc)
@@ -418,7 +422,8 @@ def _has_nvidia_gpu() -> bool:
     for nv in candidates:
         if nv and os.path.isfile(nv):
             try:
-                probe = subprocess.run([nv, "-L"], capture_output=True, timeout=20, check=False)
+                probe = subprocess.run([nv, "-L"], capture_output=True, timeout=20, check=False,
+                       creationflags=CREATE_NO_WINDOW)
                 return probe.returncode == 0
             except (OSError, subprocess.TimeoutExpired):
                 return False
@@ -430,12 +435,14 @@ def install_torch_with_cuda(env_python: Path, report: ProgressReporter, log_path
 
     PyPI 与国内镜像的 torch 是 CPU 构建（+cpu），在 NVIDIA 显卡上推理慢 10~30 倍；
     有 GPU 时优先走官方 cu 索引。失败回退镜像 CPU 版（功能可用，只是慢）。"""
-    command = [str(env_python), "-m", "pip", "install", "--upgrade",
+    # 注意：不能带 --extra-index-url（会引入 PyPI 的 +cpu 版干扰 pip 选版本），
+    # 也不能 --no-deps（torch 的 nvidia-* CUDA 运行库也要从 cu129 索引装）。
+    # 其余公共依赖（sympy 等）在调用本函数前已由镜像源装好，这里 pip 会判定满足。
+    command = [str(env_python), "-m", "pip", "install",
                "--index-url", TORCH_CUDA_INDEX_URL,
-               "--extra-index-url", PYPI_INDEX_FALLBACKS[0],
                "--timeout", "60", "--retries", "5", "--disable-pip-version-check",
                "--no-input", "--progress-bar", "off",
-               "--force-reinstall", "--no-deps", "--no-cache-dir", "torch"]
+               "--no-cache-dir", "--force-reinstall", "torch"]
     try:
         run_checked(command, error_prefix="安装 GPU 版 PyTorch 失败",
                     log_path=log_path, report=report,
@@ -465,12 +472,20 @@ def install_qwen_dependencies(env_python: Path, report: ProgressReporter, log_pa
     )
     has_gpu = _has_nvidia_gpu()
     if has_gpu:
+        # 先装公共依赖（qwen-asr 会带上 torch 所需的 sympy/jinja2 等），
+        # 再单独从 cu129 索引装 GPU 版 torch——避免 --extra-index-url 引入 PyPI +cpu 版干扰。
+        pip_install_with_index_fallback(
+            env_python, ["qwen-asr", "huggingface_hub", "modelscope", "onnxruntime"],
+            error_prefix="安装本地 Qwen 依赖失败",
+            report=report,
+            log_path=log_path,
+            heartbeat=("安装依赖", "正在安装识别引擎依赖（qwen-asr 等，非模型文件），下载中断会自动重试，请保持网络连接"),
+            extra_args=["--resume-retries", "5"],
+        )
         install_torch_with_cuda(env_python, report, log_path)
-        packages = ["qwen-asr", "huggingface_hub", "modelscope", "onnxruntime"]
-    else:
-        packages = ["qwen-asr", "torch", "huggingface_hub", "modelscope", "onnxruntime"]
+        return
     pip_install_with_index_fallback(
-        env_python, packages,
+        env_python, ["qwen-asr", "torch", "huggingface_hub", "modelscope", "onnxruntime"],
         error_prefix="安装本地 Qwen 依赖失败",
         report=report,
         log_path=log_path,
@@ -498,6 +513,7 @@ def ensure_modelscope_downloader(env_python: Path, report: ProgressReporter, log
         probe = subprocess.run(
             [str(env_python), "-c", "from modelscope.hub.snapshot_download import snapshot_download"],
             check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+            creationflags=CREATE_NO_WINDOW,
         )
         if probe.returncode == 0:
             return
@@ -535,6 +551,7 @@ def fetch_model_total_bytes(env_python: Path, source: str = "modelscope") -> int
             capture_output=True,
             text=True,
             timeout=30,
+            creationflags=CREATE_NO_WINDOW,
         )
         total = int(result.stdout.strip().rsplit("\n", 1)[-1])
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):

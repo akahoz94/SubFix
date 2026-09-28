@@ -29,6 +29,9 @@ import wave
 from collections import Counter
 from pathlib import Path
 from typing import Any
+# 隐藏子进程控制台窗口，杜绝黑框
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
 
 
 class _LazyGenerateV4:
@@ -3810,7 +3813,7 @@ def cut_audio(
     if audio_channel_index is not None and audio_channel_index > 0:
         cmd.extend(["-filter:a", f"pan=mono|c0=c{audio_channel_index - 1}"])
     cmd.extend(["-ac", "1", "-ar", "16000", "-vn", str(output)])
-    subprocess.run(cmd, check=True, text=True, capture_output=True)
+    subprocess.run(cmd, check=True, text=True, capture_output=True, creationflags=CREATE_NO_WINDOW)
 
 
 def transcribe_mlx_whisper(audio_path: Path, model: str, language: str | None) -> dict[str, Any]:
@@ -4506,7 +4509,7 @@ def transcribe_external_backend(audio_path: Path, model: str, language: str | No
             model=shlex.quote(str(model)),
             language=shlex.quote(str(language or "auto")),
         )
-        result = subprocess.run(command, shell=True, text=True, capture_output=True)
+        result = subprocess.run(command, shell=True, text=True, capture_output=True, creationflags=CREATE_NO_WINDOW)
         if result.returncode != 0:
             error_text = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(f"{backend} 执行失败: {error_text}")
@@ -6573,7 +6576,7 @@ def qwen3_cpp_forced_align_text_rows(
         "-o",
         str(output_path),
     ]
-    result = subprocess.run(cmd, text=True, capture_output=True)
+    result = subprocess.run(cmd, text=True, capture_output=True, creationflags=CREATE_NO_WINDOW)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"Qwen3 forced align 执行失败: {detail or result.returncode}")
