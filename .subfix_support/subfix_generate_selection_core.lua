@@ -3766,6 +3766,8 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
         cmd_parts[#cmd_parts + 1] = "--script-file"
         cmd_parts[#cmd_parts + 1] = shell_quote(script_file_path)
     end
+    -- 常驻服务转发：serve 可达则模型零加载执行，不可达自动拉起/回退普通流程
+    cmd_parts[#cmd_parts + 1] = "--via-serve"
     return table.concat(cmd_parts, " "), nil, env_pairs
 end
 

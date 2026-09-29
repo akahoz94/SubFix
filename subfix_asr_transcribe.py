@@ -7284,13 +7284,188 @@ def run_qwen_forced_align_batch_plan(
     return payload
 
 
+SUBFIX_SERVE_PORT_BASE = 53177
+SUBFIX_SERVE_READY_GLOB = "subfix_serve_*.json"
+
+
+def _serve_ready_dir() -> Path:
+    return Path(tempfile.gettempdir())
+
+
+def _serve_request(argv: list[str], host: str, port: int, connect_timeout: float = 5.0) -> bool:
+    """向 serve 实例转发一次请求；连不上/超时返回 False（调用方回退）。"""
+    import socket
+
+    with socket.create_connection((host, port), timeout=connect_timeout) as conn:
+        conn.settimeout(3600.0)  # 转录按分钟计；取消由调用方杀进程树承担
+        conn.sendall((json.dumps({"argv": argv}) + "\n").encode("utf-8"))
+        buffer = b""
+        while b"\n" not in buffer:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            buffer += chunk
+    response = json.loads(buffer.decode("utf-8", errors="replace") or "{}")
+    if not response.get("ok"):
+        raise RuntimeError(str(response.get("error") or "serve 请求失败"))
+    return True
+
+
+def try_serve_relay(argv: list[str]) -> bool:
+    """把本次调用转发给常驻 serve；不可用则拉起一个。
+
+    两种情形严格分开，避免双进程抢显存（实测并发时全员掉进 sysmem fallback，
+    30 秒请求拖到 21 分钟）：
+    - 已有就绪文件 → 只排队转发（serve 串行处理，忙时等待），绝不冷启动；
+    - 无就绪文件   → 拉起 detached 实例，等就绪后转发，超时才回退普通流程。
+    """
+    import glob
+    import socket
+
+    ready_paths = sorted(glob.glob(str(_serve_ready_dir() / SUBFIX_SERVE_READY_GLOB)))
+    if ready_paths:
+        # serve 在忙上一个请求时 accept/响应都可能慢：给足排队时间，不回退
+        deadline = time.monotonic() + 3600.0
+        while time.monotonic() < deadline:
+            for info_path in ready_paths:
+                try:
+                    info = json.loads(Path(info_path).read_text(encoding="utf-8"))
+                    if _serve_request(argv, "127.0.0.1", int(info["port"])):
+                        return True
+                except (OSError, ValueError, RuntimeError):
+                    pass
+            time.sleep(2.0)
+        return False
+
+    import subprocess
+
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--mode", "serve",
+             "--serve-idle-timeout", str(int(os.getenv("SUBFIX_SERVE_IDLE_TIMEOUT") or "900"))],
+            **popen_kwargs,
+        )
+    except OSError:
+        return False
+    deadline = time.monotonic() + float(os.getenv("SUBFIX_SERVE_SPAWN_TIMEOUT") or "240")  # 覆盖冷启动 import torch + 双模型加载
+    while time.monotonic() < deadline:
+        time.sleep(1.0)
+        for info_path in sorted(glob.glob(str(_serve_ready_dir() / SUBFIX_SERVE_READY_GLOB))):
+            try:
+                info = json.loads(Path(info_path).read_text(encoding="utf-8"))
+                if _serve_request(argv, "127.0.0.1", int(info["port"])):
+                    return True
+            except (OSError, ValueError, RuntimeError):
+                continue
+    return False
+
+
+def run_serve_server(port: int = SUBFIX_SERVE_PORT_BASE, idle_timeout: float = 900.0) -> int:
+    """常驻转录服务：预载模型后监听 127.0.0.1，转发 argv 请求跑完整 main 管线。
+
+    模型缓存（_QWEN3_ASR_MODEL_CACHE 等）跨请求保留——第二次请求起零加载。
+    串行处理请求；空闲超过 idle_timeout 自动退出并清理就绪文件。
+    彻底取消一个正在跑的请求 = 杀本进程（PID 在就绪文件里）。
+    """
+    import socket
+
+    # 预热：吸收 import torch + 双模型加载；失败不退出，首个请求时再暴露具体错误
+    warm_error = None
+    try:
+        load_qwen3_asr_model(os.getenv("SUBFIX_QWEN3_ASR_MODEL") or QWEN3_ASR_MODEL)
+        load_qwen3_forced_aligner()
+    except Exception as exc:
+        warm_error = str(exc)[:300]
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    chosen_port = None
+    for candidate in range(port, port + 11):
+        try:
+            server.bind(("127.0.0.1", candidate))
+            chosen_port = candidate
+            break
+        except OSError:
+            continue
+    if chosen_port is None:
+        print(f"[serve] 端口 {port}-{port + 10} 均被占用，退出", file=sys.stderr)
+        return 2
+    server.listen(1)
+    server.settimeout(1.0)
+
+    ready_path = _serve_ready_dir() / f"subfix_serve_{chosen_port}.json"
+    ready_path.write_text(
+        json.dumps({"port": chosen_port, "pid": os.getpid(), "warm_error": warm_error}),
+        encoding="utf-8",
+    )
+    print(f"[serve] 就绪 127.0.0.1:{chosen_port} pid={os.getpid()} warm_error={warm_error}", flush=True)
+
+    last_activity = time.monotonic()
+    try:
+        while True:
+            if time.monotonic() - last_activity > idle_timeout:
+                break
+            try:
+                conn, _addr = server.accept()
+            except socket.timeout:
+                continue
+            try:
+                conn.settimeout(3600.0)
+                buffer = b""
+                while b"\n" not in buffer:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                request = json.loads(buffer.decode("utf-8", errors="replace") or "{}")
+                request_argv = [str(item) for item in (request.get("argv") or [])]
+                last_activity = time.monotonic()
+                try:
+                    exit_code = main([item for item in request_argv if item != "--via-serve"])
+                    response = {"ok": int(exit_code or 0) == 0, "exit_code": int(exit_code or 0)}
+                except SystemExit as exc:
+                    response = {"ok": int(exc.code or 0) == 0}
+                except Exception as exc:
+                    response = {"ok": False, "error": str(exc)[:400]}
+                last_activity = time.monotonic()
+            except (OSError, ValueError) as exc:
+                response = {"ok": False, "error": f"请求解析失败: {exc}"[:200]}
+            try:
+                conn.sendall((json.dumps(response) + "\n").encode("utf-8"))
+            except OSError:
+                pass
+            finally:
+                conn.close()
+    finally:
+        server.close()
+        ready_path.unlink(missing_ok=True)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # 常驻服务转发：--via-serve 在 argparse 之前摘除。serve 可达则由它执行完整
+    # 管线（模型常驻，产物照旧落盘）；不可达则拉起 serve 重试一次，仍失败就地
+    # 继续普通流程——调用方（Lua）除多传一个标志外零感知。
+    if "--via-serve" in argv:
+        argv.remove("--via-serve")
+        if os.environ.get("SUBFIX_SERVE", "1") != "0":
+            if try_serve_relay(argv):
+                return 0
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio")
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output", default=None)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--language", default="auto")
     parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--serve-idle-timeout", type=float, default=900.0)
     parser.add_argument("--source-start", type=float, default=0.0)
     parser.add_argument("--source-end", type=float)
     parser.add_argument("--audio-channel-index", type=int)
@@ -7332,6 +7507,7 @@ def main(argv: list[str] | None = None) -> int:
             "generate_subtitles_batch",
             "learn_segmentation_profile",
             "onsets",
+            "serve",
         ),
         default="transcribe",
     )
@@ -7356,7 +7532,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    output_path = Path(args.output)
+    if args.mode != "serve" and not args.output:
+        parser.error("--output is required unless --mode serve")
+    output_path = Path(args.output or Path(tempfile.gettempdir()) / "subfix_serve_unused.json")
     progress_path = Path(args.progress_json) if args.progress_json else None
     try:
         diagnostic: dict[str, Any] = {
@@ -7367,6 +7545,11 @@ def main(argv: list[str] | None = None) -> int:
             "source_end": args.source_end,
         }
         transcribe_windows = load_transcribe_windows(args.windows_json)
+        if args.mode == "serve":
+            return run_serve_server(
+                port=int(os.getenv("SUBFIX_SERVE_PORT") or "53177"),
+                idle_timeout=float(getattr(args, "serve_idle_timeout", 900.0) or 900.0),
+            )
         if args.mode == "learn_segmentation_profile":
             if not args.calibration_json:
                 raise RuntimeError("缺少 --calibration-json")
