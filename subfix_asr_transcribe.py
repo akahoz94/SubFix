@@ -3601,6 +3601,46 @@ def ctc_forced_align_char_segments(
     return char_segments
 
 
+def _silero_speech_regions(
+    wav_path: Path, sample_rate: int, samples_int16_mono: Any, merge_gap_seconds: float, min_region_seconds: float
+) -> tuple[list[dict[str, float]] | None, list[float], dict[str, Any]]:
+    """Silero VAD 版语音区检测；返回 None 表示不可用（调用方回退能量法）。
+
+    samples_int16_mono 必须是单声道 int16（Silero 模块的 API 契约——它内部
+    自己做 /32768 归一化；喂归一化 float 会被 frombuffer 按 int16 解读成垃圾，
+    实测静音 91 区全空）。
+    """
+    try:
+        import subfix_silero_vad as silero
+    except Exception:
+        return None, [], {}
+    if not silero.available():
+        return None, [], {}
+    try:
+        intervals = silero.detect_speech_intervals(samples_int16_mono, sample_rate)
+    except Exception as exc:
+        return None, [], {"silero_error": str(exc)[:200]}
+
+    # Silero 紧边界 + padding 对齐能量法 hangover/merge 语义（0.12s/0.08s）
+    pad = 0.10
+    merged: list[dict[str, float]] = []
+    for start, end in intervals:
+        padded = {"start": max(0.0, start - pad), "end": end + pad}
+        if padded["end"] - padded["start"] < min_region_seconds:
+            continue
+        if merged and padded["start"] - merged[-1]["end"] <= merge_gap_seconds:
+            merged[-1]["end"] = max(merged[-1]["end"], padded["end"])
+        else:
+            merged.append({"start": round(padded["start"], 3), "end": round(padded["end"], 3)})
+    onsets = [region["start"] for region in merged]
+    diagnostic = {
+        "vad_mode": "silero",
+        "speech_region_count": len(merged),
+        "speech_onset_count": len(onsets),
+    }
+    return merged, onsets, diagnostic
+
+
 def detect_speech_regions(
     wav_path: Path,
     window_seconds: float = 0.01,
@@ -3619,8 +3659,20 @@ def detect_speech_regions(
     _usable = len(_raw_arr) // channels * channels
     if channels > 1:
         samples = _np.mean(_raw_arr[:_usable].reshape(-1, channels).astype(_np.float64), axis=1) / 32768.0
+        # Silero 契约要单声道 int16：多声道混缩回 int16
+        silero_samples = _np.mean(_raw_arr[:_usable].reshape(-1, channels).astype(_np.float64), axis=1)
+        silero_samples = _np.clip(silero_samples, -32768, 32767).astype(_np.int16)
     else:
         samples = _raw_arr[:_usable].astype(_np.float64) / 32768.0
+        silero_samples = _raw_arr[:_usable]
+
+    # Silero 优先（神经 VAD，嘈杂背景下比能量阈值稳）；模型/运行时缺失回退能量法
+    silero_regions, silero_onsets, silero_diag = _silero_speech_regions(
+        wav_path, sample_rate, silero_samples, merge_gap_seconds, min_region_seconds
+    )
+    if silero_regions is not None:
+        return silero_regions, silero_onsets, silero_diag
+
     window_size = max(1, int(sample_rate * window_seconds))
     arr = samples
     total = len(arr)
