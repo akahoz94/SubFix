@@ -351,7 +351,7 @@ function subfix_launch_bg_batch(batch_file, pid_file)
     subfix_execute_hidden('start "SubFixBG" /b cmd /c "' .. subfix_cmd_path(batch_file) .. '"')
 end
 
-SUBFIX_VERSION = "3.6.0"
+SUBFIX_VERSION = "3.7.0"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -12976,24 +12976,6 @@ function load_generate_selection_core_for_subfix()
     return core_or_err, nil, script_root
 end
 
--- 文稿校对：把用户文稿写成 UTF-8 临时文件（Lua 字符串即字节流，不做任何转码），失败返回 nil
-local function write_reference_script_temp_file(script_text)
-    local base_dir = current_backup_path ~= "" and current_backup_path or "/tmp"
-    local uid = tostring(os.time()) .. "_" .. tostring(math.floor(os.clock() * 1000))
-    local path = base_dir .. "/SubFix_Script_" .. uid .. ".txt"
-    ensure_backup_directory()
-    if SUBFIX_IS_WINDOWS and subfix_write_file_w then
-        -- Windows 下 io.open 走 ANSI，中文路径必败，用 CreateFileW 写
-        if subfix_write_file_w(path, script_text) then return path end
-        return nil
-    end
-    local file = io.open(path, "wb")
-    if not file then return nil end
-    file:write(script_text)
-    file:close()
-    return path
-end
-
 function run_generate_selection_subtitles_from_subfix(target_window)
     local window = resolve_window(target_window)
     update_shared_status(window, "正在生成选区字幕...")
@@ -13004,19 +12986,10 @@ function run_generate_selection_subtitles_from_subfix(target_window)
         return false
     end
 
-    -- 文稿校对：非空文稿落成 UTF-8 临时文件经 --script-file 传给 ASR helper；空文稿保持原有行为
-    local script_file_path = nil
-    local script_text = sanitize_reference_script_text(read_shared_config_from_ui().script_content)
-    if script_text ~= "" then
-        script_file_path = write_reference_script_temp_file(script_text)
-    end
-
     local ok, run_err = core.run({
         script_root = script_root,
-        target_subtitle_track = 1,
-        script_file_path = script_file_path
+        target_subtitle_track = 1
     })
-    if script_file_path then subfix_remove_files(script_file_path) end
     if not ok then
         local message = tostring(run_err or "生成选区字幕失败")
         if message:find("已取消", 1, true) then

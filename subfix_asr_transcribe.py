@@ -48,6 +48,7 @@ class _LazyGenerateV4:
         if spec is None or spec.loader is None:
             raise RuntimeError("v4 生成模块无法加载")
         module = importlib.util.module_from_spec(spec)
+        sys.modules["subfix_generate_v4"] = module  # py3.14 dataclass 需要 sys.modules 里有本模块
         spec.loader.exec_module(module)
         self._module = module
         return module
@@ -72,6 +73,7 @@ class _LazyGenerateV5:
         if spec is None or spec.loader is None:
             raise RuntimeError("v5 生成模块无法加载")
         module = importlib.util.module_from_spec(spec)
+        sys.modules["subfix_generate_v5"] = module  # py3.14 dataclass 需要 sys.modules 里有本模块
         spec.loader.exec_module(module)
         self._module = module
         return module
@@ -96,6 +98,7 @@ class _LazyScriptProofread:
         if spec is None or spec.loader is None:
             raise RuntimeError("文稿校对模块无法加载")
         module = importlib.util.module_from_spec(spec)
+        sys.modules["subfix_script_proofread"] = module  # py3.14 dataclass 需要 sys.modules 里有本模块
         spec.loader.exec_module(module)
         self._module = module
         return module
@@ -105,6 +108,34 @@ class _LazyScriptProofread:
 
 
 script_proofread = _LazyScriptProofread()
+
+
+class _LazyScriptDirect:
+    """文稿直出引擎懒加载（同 script_proofread 模式）。"""
+
+    def __init__(self) -> None:
+        self._module: Any = None
+
+    def _load(self) -> Any:
+        if self._module is not None:
+            return self._module
+        module_path = Path(__file__).resolve().with_name("subfix_script_direct.py")
+        if not module_path.is_file():
+            raise RuntimeError(f"文稿直出模块缺失: {module_path.name}")
+        spec = importlib.util.spec_from_file_location("subfix_script_direct", module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("文稿直出模块无法加载")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["subfix_script_direct"] = module  # py3.14 dataclass 需要 sys.modules 里有本模块
+        spec.loader.exec_module(module)
+        self._module = module
+        return module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+script_direct = _LazyScriptDirect()
 
 
 class _LazyGenerateTextnorm:
@@ -5619,6 +5650,127 @@ def select_adaptive_subtitle_candidates(
     }
 
 
+def try_script_direct_subtitles(
+    batches: list[dict[str, Any]],
+    args: argparse.Namespace,
+    progress_path: Path | None,
+) -> dict[str, Any] | None:
+    """文稿直出尝试：整段文稿单次对齐 → 映射 → 质量门。
+
+    成功返回与 v4 计划同构的结果 payload（调用方直接返回，跳过 ASR/分句/校对）；
+    失败把机器可读原因挂 args._direct_fail_reasons 并返回 None（调用方回退
+    常规路径；direct 模式下由调用方报错）。音频超 300s、多轨批次直接不尝试。
+    """
+    reasons: list[str] = []
+    args._direct_fail_reasons = reasons
+    if len(batches) != 1:
+        reasons.append("MULTIPLE_BATCHES_UNSUPPORTED")
+        return None
+    batch = batches[0]
+    script_path_value = getattr(args, "script_file", None)
+    if not script_path_value:
+        reasons.append("NO_SCRIPT")
+        return None
+    script_text = Path(str(script_path_value)).read_text(encoding="utf-8")
+    if not script_text.strip():
+        reasons.append("SCRIPT_EMPTY")
+        return None
+    try:
+        lines = script_direct.parse_reference_lines(script_text)
+    except ValueError:
+        reasons.append("SCRIPT_EMPTY")
+        return None
+
+    audio_path = Path(str(batch.get("audio") or ""))
+    if not audio_path.is_file():
+        reasons.append("AUDIO_FILE_MISSING")
+        return None
+    fps = float(batch.get("fps") or 30.0)
+    duration = audio_duration_seconds(audio_path)
+    if duration <= 0.0:
+        reasons.append("AUDIO_DURATION_UNKNOWN")
+        return None
+    if duration > script_direct.DIRECT_MAX_AUDIO_SECONDS:
+        reasons.append("AUDIO_TOO_LONG_FOR_DIRECT_ALIGNMENT")
+        return None
+
+    write_progress(
+        progress_path, "script_direct", "文稿直出：整段对齐中",
+        batch_index=0, total_batches=1, progress_index=20, progress_total=100,
+    )
+    try:
+        aligner = load_qwen3_forced_aligner()
+        from qwen_asr.inference.utils import normalize_audios
+        waveform = normalize_audios([str(audio_path)])[0]
+        results = aligner.align(
+            audio=[(waveform, 16000)],
+            text=[script_text],
+            language=[qwen3_language_name(getattr(args, "language", None)) or "Chinese"],
+        )
+        alignment = results[0] if isinstance(results, list) and results else results
+    except Exception as exc:
+        reasons.append(f"DIRECT_EXCEPTION:{type(exc).__name__}")
+        diagnostic_note = str(exc)[:200]
+        args._direct_fail_detail = diagnostic_note
+        return None
+
+    tokens = [
+        {"text": str(item.text), "start": float(item.start_time), "end": float(item.end_time)}
+        for item in getattr(alignment, "items", []) or []
+    ]
+    mapping = script_direct.map_aligned_tokens_to_lines(
+        tokens, lines, language=qwen3_language_name(getattr(args, "language", None)) or "Chinese",
+    )
+    quality = script_direct.evaluate_direct_quality(
+        tokens, mapping, line_count=len(lines), duration=duration,
+    )
+    if not quality.passed:
+        reasons.extend(quality.reasons)
+        return None
+
+    track_index = int(batch.get("track_index") or 0)
+    timeline_start_frame = int(batch.get("timeline_start_frame") or 0)
+    rows = script_direct.build_direct_rows(mapping, fps=fps, speaker_track_index=track_index)
+    try:
+        refined, _refine_diag = generate_v5.refine_subtitle_boundaries(
+            rows, audio_path, timeline_start_frame, fps,
+        )
+        refined, _conflicts = generate_v5.preserve_refined_row_order(refined)
+        rows = refined
+    except Exception:
+        pass  # 直出行边界已由对齐决定，refine 只是锦上添花
+
+    write_progress(
+        progress_path, "write_output", "文稿直出完成",
+        batch_index=1, total_batches=1, progress_index=95, progress_total=100,
+    )
+    return {
+        "ok": True,
+        "backend": "qwen3_script_direct",
+        "model": os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or QWEN3_FORCED_ALIGNER_MODEL,
+        "segments": [],
+        "subtitle_rows": rows,
+        "batches": [dict(batch, ok=True)],
+        "text": "".join(str(row.get("text") or "") for row in rows),
+        "diagnostic": {
+            "mode": "generate_subtitles_batch",
+            "generate_engine": str(getattr(args, "generate_engine", "v5") or "v5"),
+            "script_direct": {
+                "path": "direct",
+                "line_count": len(lines),
+                "unique_interval_ratio": round(quality.unique_interval_ratio, 4),
+                "aligned_span_ratio": round(quality.aligned_span_ratio, 4),
+                "intervals": {
+                    "invalid": quality.intervals.invalid_count,
+                    "non_monotonic": quality.intervals.non_monotonic_count,
+                    "overlap": quality.intervals.overlap_count,
+                    "out_of_bounds": quality.intervals.out_of_bounds_count,
+                },
+            },
+        },
+    }
+
+
 def run_generate_subtitles_batch_plan_v4(
     batches: list[dict[str, Any]],
     args: argparse.Namespace,
@@ -5644,6 +5796,21 @@ def run_generate_subtitles_batch_plan_v4(
         raise RuntimeError(f"缺少 generate_subtitles {engine_label} batch plan")
     if fixture_payload is not None:
         raise RuntimeError(f"{engine_label} fixture 必须提供独立 aligned-unit 测试入口")
+
+    # 文稿直出（Script Match）：有稿且照稿念的素材跳过整个 ASR，只剩对齐。
+    # 质量门任一项不过即回退常规「转录 + 校对」路径；direct 模式失败则报原因。
+    direct_mode = str(getattr(args, "script_direct_mode", "auto") or "auto").lower()
+    if direct_mode not in {"auto", "proofread", "direct"}:
+        direct_mode = "auto"
+    script_file_path_value = getattr(args, "script_file", None)
+    if script_file_path_value and direct_mode in {"auto", "direct"}:
+        direct_outcome = try_script_direct_subtitles(batches, args, progress_path)
+        if direct_outcome is not None:
+            return direct_outcome
+        if direct_mode == "direct":
+            raise RuntimeError(
+                "照稿直出未通过质量门：" + "；".join(getattr(args, "_direct_fail_reasons", []))
+            )
     subtitle_mode = str(getattr(args, "subtitle_mode", "narration") or "narration")
     if subtitle_mode not in {"narration", "live"}:
         subtitle_mode = "narration"
@@ -7571,6 +7738,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "用户文稿文件（UTF-8）。提供时在断句前做文稿校对：同音别字/标点"
             "差异采用文稿写法，结构差异保转录；文稿内容绝不新增进字幕。"
+        ),
+    )
+    parser.add_argument(
+        "--script-direct-mode",
+        choices=("auto", "proofread", "direct"),
+        default="auto",
+        help=(
+            "文稿用途：auto=先试文稿直出，质量门不过自动回退转录校对；"
+            "proofread=仅校对不尝试直出；direct=强制直出，失败报原因。"
         ),
     )
     parser.add_argument(

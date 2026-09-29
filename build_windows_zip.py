@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
-PLUGIN_LUA = ["SubFix.lua", "生成选区字幕.lua"]
+PLUGIN_LUA = ["SubFix.lua", "生成选区字幕.lua", "文稿匹配.lua"]
 # 安装布局里所有 python 助手都进 .subfix_support/；其中 4 个在开发树位于仓库根目录
 ROOT_PY = [
     "subfix_asr_transcribe.py",
