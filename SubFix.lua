@@ -218,10 +218,7 @@ function subfix_temp_root()
     if SUBFIX_WIN_FFI then
         return subfix_env_w("TEMP") or subfix_env_w("TMP") or "C:/Windows/Temp"
     end
-    if SUBFIX_IS_WINDOWS then
-        return os.getenv("TEMP") or os.getenv("TMP") or "C:/Windows/Temp"
-    end
-    return os.getenv("TMPDIR") or "/tmp"
+    return os.getenv("TEMP") or os.getenv("TMP") or "C:/Windows/Temp"
 end
 
 function subfix_cmd_path(path)
@@ -280,8 +277,6 @@ function subfix_kill_tree(pid)
     if not pid or pid <= 0 then return end
     if SUBFIX_IS_WINDOWS then
         subfix_execute_hidden(string.format("taskkill /PID %d /T /F >nul 2>&1", pid))
-    else
-        os.execute(string.format("pkill -P %d 2>/dev/null; kill -9 %d 2>/dev/null", pid, pid))
     end
 end
 
@@ -391,57 +386,7 @@ function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
         return nil
     end
 
-    -- JXA 的返回值写入 stdout；console.log 写入 stderr，会被下面的重定向丢弃。
-    local jxa = [[(function () {
-    ObjC.import("AppKit");
-    ObjC.import("CoreGraphics");
-    const screens = $.NSScreen.screens;
-    const primary = screens.objectAtIndex(0);
-    const desktopTop = Number(primary.frame.origin.y) + Number(primary.frame.size.height);
-    function screenRect(frame) {
-        return {x: Number(frame.origin.x),
-            y: desktopTop - Number(frame.origin.y) - Number(frame.size.height),
-            width: Number(frame.size.width), height: Number(frame.size.height)};
-    }
-    let selected = primary;
-    let mainWindow = null;
-    let largestArea = 0;
-    try {
-        const raw = $.CGWindowListCopyWindowInfo(17, 0);
-        const windows = ObjC.deepUnwrap(ObjC.castRefToObject(raw));
-        for (const window of windows) {
-            if (!/^(DaVinci Resolve|Resolve)$/i.test(String(window.kCGWindowOwnerName || ""))
-                || Number(window.kCGWindowLayer) !== 0 || Number(window.kCGWindowAlpha) === 0) continue;
-            const bounds = window.kCGWindowBounds;
-            const area = bounds ? Number(bounds.Width) * Number(bounds.Height) : 0;
-            if (area > largestArea) { largestArea = area; mainWindow = bounds; }
-        }
-    } catch (error) {
-        // Window information may be unavailable; retain the primary display fallback.
-    }
-    if (mainWindow) {
-        let largestOverlap = 0;
-        for (let i = 0; i < Number(screens.count); i++) {
-            const screen = screens.objectAtIndex(i);
-            const rect = screenRect(screen.frame);
-            const overlapWidth = Math.max(0, Math.min(rect.x + rect.width, Number(mainWindow.X) + Number(mainWindow.Width)) - Math.max(rect.x, Number(mainWindow.X)));
-            const overlapHeight = Math.max(0, Math.min(rect.y + rect.height, Number(mainWindow.Y) + Number(mainWindow.Height)) - Math.max(rect.y, Number(mainWindow.Y)));
-            const overlap = overlapWidth * overlapHeight;
-            if (overlap > largestOverlap) { largestOverlap = overlap; selected = screen; }
-        }
-    }
-    const visible = screenRect(selected.visibleFrame);
-    return [visible.x, visible.y, visible.width, visible.height].join(",");
-})();]]
-    local escaped = jxa:gsub("'", "'\\\"'\\\"'")
-    local pipe = io.popen("/usr/bin/osascript -l JavaScript -e '" .. escaped .. "' 2>/dev/null", "r")
-    if not pipe then return nil end
-    local output = pipe:read("*a") or ""
-    pipe:close()
-    local x, y, width, height = output:match("^%s*([%-%.%d]+),([%-%.%d]+),([%-%.%d]+),([%-%.%d]+)%s*$")
-    x, y, width, height = tonumber(x), tonumber(y), tonumber(width), tonumber(height)
-    if not x or not y or not width or not height or width <= 0 or height <= 0 then return nil end
-    return {x = x, y = y, width = width, height = height}
+    return nil
 end
 
 function SUBFIX_WINDOW_GEOMETRY.centered_geometry(fallback_geometry)
@@ -7479,224 +7424,6 @@ local function detect_subtitle_track_delta(before_snapshot, after_snapshot)
     return result
 end
 
-local function get_subtitle_track_label_candidates(track_index, timeline)
-    local labels = {}
-    local seen = {}
-
-    local function add_label(label)
-        local value = trim(label or "")
-        if value == "" then return end
-        if not seen[value] then
-            seen[value] = true
-            table.insert(labels, value)
-        end
-    end
-
-    add_label("ST" .. tostring(track_index))
-    add_label("字幕" .. tostring(track_index))
-    add_label("字幕 " .. tostring(track_index))
-    add_label("Subtitle " .. tostring(track_index))
-    add_label("Subtitle" .. tostring(track_index))
-
-    if timeline then
-        local ok_name, track_name = pcall(function() return timeline:GetTrackName("subtitle", track_index) end)
-        if ok_name and track_name then
-            local resolved_name = trim(track_name)
-            add_label(resolved_name)
-            add_label(resolved_name:gsub("%s+", ""))
-        end
-    end
-
-    return labels
-end
-
-local function activate_subtitle_target_track_via_ui(track_index, timeline)
-    if not track_index or track_index < 1 then
-        return false, "字幕目标轨无效"
-    end
-
-    if package.config:sub(1, 1) ~= "/" then
-        return false, "仅 macOS 支持字幕轨 UI 自动切换"
-    end
-
-    local label_candidates = get_subtitle_track_label_candidates(track_index, timeline)
-    local candidates_literal = table.concat(label_candidates, "||")
-    local script_path = (os.getenv("TMPDIR") or "/tmp/") .. "hooper_set_subtitle_target_track.js"
-    local script_file = io.open(script_path, "w")
-    if not script_file then
-        return false, "无法创建 UI 自动化脚本"
-    end
-
-    local jxa_script = [[
-ObjC.import('Cocoa');
-ObjC.import('ApplicationServices');
-
-function safeCall(fn, fallback) {
-    try { return fn(); } catch (e) { return fallback; }
-}
-
-function asString(value) {
-    return value === undefined || value === null ? '' : String(value);
-}
-
-function rectForElement(el) {
-    var pos = safeCall(function () { return el.position(); }, null);
-    var size = safeCall(function () { return el.size(); }, null);
-    if (!pos || !size) return null;
-    return {
-        x: Number(pos[0]),
-        y: Number(pos[1]),
-        w: Number(size[0]),
-        h: Number(size[1])
-    };
-}
-
-function centerY(rect) {
-    return rect.y + rect.h / 2;
-}
-
-function clickAt(x, y) {
-    function post(type) {
-        var event = $.CGEventCreateMouseEvent($(), type, $.CGPointMake(x, y), $.kCGMouseButtonLeft);
-        $.CGEventPost($.kCGHIDEventTap, event);
-    }
-
-    post($.kCGEventMouseMoved);
-    delay(0.03);
-    post($.kCGEventLeftMouseDown);
-    delay(0.03);
-    post($.kCGEventLeftMouseUp);
-    delay(0.15);
-}
-
-function run(argv) {
-    var targetCandidates = String(argv[0] || '').split('||').filter(function (item) { return item.length > 0; });
-    function normalized(text) {
-        return asString(text).replace(/\s+/g, '').toLowerCase();
-    }
-
-    var se = Application('System Events');
-    se.includeStandardAdditions = true;
-    var proc = se.processes.byName('DaVinci Resolve');
-    if (!proc.exists()) {
-        throw new Error('找不到 DaVinci Resolve 进程');
-    }
-
-    proc.frontmost = true;
-    delay(0.10);
-
-    var windows = proc.windows();
-    if (!windows || windows.length === 0) {
-        throw new Error('找不到 DaVinci Resolve 窗口');
-    }
-
-    var win = windows[0];
-    var maxArea = 0;
-    for (var w = 0; w < windows.length; w++) {
-        var candidateRect = rectForElement(windows[w]);
-        if (candidateRect) {
-            var area = candidateRect.w * candidateRect.h;
-            if (area > maxArea) {
-                maxArea = area;
-                win = windows[w];
-            }
-        }
-    }
-
-    var elements = win.entireContents();
-    var labelRect = null;
-
-    for (var i = 0; i < elements.length; i++) {
-        var el = elements[i];
-        var role = asString(safeCall(function () { return el.role(); }, ''));
-        if (role !== 'AXStaticText' && role !== 'AXTextField' && role !== 'AXButton') {
-            continue;
-        }
-
-        var candidates = [
-            asString(safeCall(function () { return el.name(); }, '')),
-            asString(safeCall(function () { return el.value(); }, '')),
-            asString(safeCall(function () { return el.description(); }, ''))
-        ];
-
-        var matched = false;
-        for (var t = 0; t < targetCandidates.length; t++) {
-            var targetNorm = normalized(targetCandidates[t]);
-            for (var c = 0; c < candidates.length; c++) {
-                if (normalized(candidates[c]) === targetNorm) {
-                    matched = true;
-                    break;
-                }
-            }
-            if (matched) {
-                break;
-            }
-        }
-
-        if (matched) {
-            var rect = rectForElement(el);
-            if (rect && rect.w > 0 && rect.h > 0) {
-                if (!labelRect || rect.x < labelRect.x) {
-                    labelRect = rect;
-                }
-            }
-        }
-    }
-
-    if (!labelRect) {
-        throw new Error('找不到字幕轨标签 ' + targetCandidates.join(', '));
-    }
-
-    var buttonRects = [];
-    for (var j = 0; j < elements.length; j++) {
-        var el2 = elements[j];
-        var role2 = asString(safeCall(function () { return el2.role(); }, ''));
-        if (role2 !== 'AXButton' && role2 !== 'AXCheckBox' && role2 !== 'AXRadioButton') {
-            continue;
-        }
-
-        var rect2 = rectForElement(el2);
-        if (!rect2 || rect2.w <= 0 || rect2.h <= 0) {
-            continue;
-        }
-
-        var sameRow = Math.abs(centerY(rect2) - centerY(labelRect)) <= Math.max(14, labelRect.h * 1.3);
-        var nearHeader = rect2.x >= (labelRect.x - 10) && rect2.x <= (labelRect.x + 180);
-        if (sameRow && nearHeader) {
-            buttonRects.push(rect2);
-        }
-    }
-
-    buttonRects.sort(function (a, b) { return a.x - b.x; });
-
-    var targetRect = buttonRects.length > 0 ? buttonRects[buttonRects.length - 1] : null;
-    var clickX = targetRect ? (targetRect.x + targetRect.w / 2) : (labelRect.x + labelRect.w + 52);
-    var clickY = targetRect ? (targetRect.y + targetRect.h / 2) : centerY(labelRect);
-
-    clickAt(clickX, clickY);
-    return 'OK ' + targetCandidates.join('|') + ' ' + Math.round(clickX) + ',' + Math.round(clickY) + ' buttons=' + buttonRects.length;
-}
-]]
-
-    script_file:write(jxa_script)
-    script_file:close()
-
-    local cmd = "osascript -l JavaScript " .. shell_quote(script_path) .. " " .. shell_quote(candidates_literal)
-    local ok, output = run_shell_capture(cmd)
-    pcall(function() os.remove(script_path) end)
-
-    output = trim(output or "")
-    if ok and output:match("^OK%s") then
-        return true, output
-    end
-
-    if output:find("not allowed assistive access", 1, true) or output:find("辅助访问", 1, true) or output:find("辅助功能", 1, true) or output:find("-1719", 1, true) then
-        return false, "macOS 未授予辅助功能权限，请先允许 Resolve 或脚本宿主控制界面"
-    end
-
-    return false, output ~= "" and output or ("切换字幕目标轨失败，尝试标签: " .. candidates_literal)
-end
-
 local function sort_rows_by_timing(rows)
     table.sort(rows, function(a, b)
         local a_start = tonumber(a and a.start_frame) or math.huge
@@ -10321,7 +10048,7 @@ function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment(audio_source, source_rows, fp
 
     ensure_backup_directory()
     local output_path = SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
-    local progress_path = "/tmp/subfix_ctc_progress_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
+    local progress_path = subfix_temp_root() .. "/subfix_ctc_progress_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
     local rows_path = SUBFIX_AUDIO_ALIGN.alignment_rows_temp_path()
     local rows_ok, rows_err = SUBFIX_AUDIO_ALIGN.write_alignment_rows_json(rows_path, source_rows, fps)
     if not rows_ok then
@@ -11037,7 +10764,7 @@ end
 
 function SUBFIX_AUDIO_ALIGN.write_gap_fill_alignment_diagnostics(records, reference_info, fps, decision_counts)
     records = type(records) == "table" and records or {}
-    local temp_dir = tostring(os.getenv("TMPDIR") or "/tmp")
+    local temp_dir = subfix_temp_root()
     if temp_dir:sub(-1) ~= "/" then
         temp_dir = temp_dir .. "/"
     end
@@ -11306,7 +11033,7 @@ function SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(batch_plan, fps, b
 
     ensure_backup_directory()
     local output_path = SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
-    local progress_path = "/tmp/subfix_qwen_align_progress_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
+    local progress_path = subfix_temp_root() .. "/subfix_qwen_align_progress_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
     local batch_plan_path = SUBFIX_AUDIO_ALIGN.alignment_rows_temp_path()
     local plan_ok, plan_err = SUBFIX_AUDIO_ALIGN.write_ctc_batch_plan_json(batch_plan_path, batch_plan, fps)
     if not plan_ok then
@@ -17008,8 +16735,8 @@ local function do_ai_fix()
     local base_sys_prompt = sys_prompt
     
     -- 写入系统的临时目录
-    local temp_req_file = "/tmp/hooper_req.json"
-    local temp_resp_file = "/tmp/hooper_resp.json"
+    local temp_req_file = subfix_temp_root() .. "/hooper_req.json"
+    local temp_resp_file = subfix_temp_root() .. "/hooper_resp.json"
 
     local function truncate_error_preview(value, max_len)
         local cleaned = trim_text(value or "")
@@ -17235,18 +16962,6 @@ local function do_ai_fix()
                     done_file = done_file
                 })
                 subfix_launch_bg_batch(batch_file)
-            else
-                -- 注意 curl_cmd 末尾已经带 2>&1；外层再加 > stdout_file 把全部合并输出落盘。
-                -- 子 shell 形式 ( ... ) & 让 echo $! 拿到的是子 shell 的 PID，
-                -- curl 是它直接子进程，pkill -P <子shell PID> 可以连带杀掉 curl。
-                local bg_cmd = string.format(
-                    "(%s > %s; touch %s) & echo $! > %s",
-                    curl_cmd,
-                    shell_quote(stdout_file),
-                    shell_quote(done_file),
-                    shell_quote(pid_file)
-                )
-                os.execute(bg_cmd)
             end
 
             AI_RUNNING = true
@@ -22556,7 +22271,7 @@ handle_main_window_close = function()
     force_quit_subfix()
 end
 
--- 强制退出：模拟 macOS Dock 右键 → 强制退出
+-- 强制退出
 -- 立即关闭所有 SubFix 窗口并退出事件循环，无确认弹窗
 -- 注意：故意不加 local，避免占用 main chunk 的 200 local 名额
 function force_quit_subfix()

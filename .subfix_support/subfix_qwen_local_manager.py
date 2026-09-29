@@ -17,12 +17,8 @@ import threading
 import time
 from typing import Callable
 
-if os.name == "nt":
-    import msvcrt
-    CREATE_NO_WINDOW = 0x08000000  # 隐藏子进程控制台窗口，杜绝黑框
-else:
-    import fcntl
-    CREATE_NO_WINDOW = 0
+import msvcrt
+CREATE_NO_WINDOW = 0x08000000  # 隐藏子进程控制台窗口，杜绝黑框
 
 
 QWEN_ASR_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
@@ -115,28 +111,19 @@ def exclusive_install_lock(lock_path: Path):
     lock_file = lock_path.open("a+", encoding="utf-8")
     acquired = False
     try:
-        if os.name == "nt":
-            try:
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                raise RuntimeError(INSTALL_IN_PROGRESS_MESSAGE) from exc
-        else:
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise RuntimeError(INSTALL_IN_PROGRESS_MESSAGE) from exc
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise RuntimeError(INSTALL_IN_PROGRESS_MESSAGE) from exc
         acquired = True
         yield
     finally:
         if acquired:
-            if os.name == "nt":
-                try:
-                    lock_file.seek(0)
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-                except OSError:
-                    pass
-            else:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            try:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
         lock_file.close()
 
 
@@ -147,7 +134,7 @@ def python_can_import_qwen_asr(python: Path) -> bool:
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            # A fresh macOS environment can spend over a minute loading native libraries.
+            # A fresh venv can spend over a minute loading native libraries.
             timeout=180,
             creationflags=CREATE_NO_WINDOW,
         )

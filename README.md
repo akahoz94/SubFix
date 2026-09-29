@@ -1,7 +1,7 @@
-# SubFix v3.3.0 Windows 版
+# SubFix Windows 版
 
-DaVinci Resolve 字幕插件的 Windows 移植版，基于上游 macOS v3.3.0（HooperH/SubFix）。
-口播、现场、单段和批量字幕生成统一使用 v5 引擎，功能与 macOS 版一致。
+DaVinci Resolve 字幕插件的独立 Windows 分支（fork 自 HooperH/SubFix，Mac 兼容层已全部移除）。
+口播、现场、单段和批量字幕生成统一使用 v5 引擎。
 
 ## 发行形态
 
@@ -49,7 +49,7 @@ qwen3-asr.cpp Windows 构建流程见 `scripts/windows/`（MinGW-w64 + CMake+Nin
 - Python 3.10-3.13（安装时勾选 Add python.exe to PATH；仅首次安装 ASR 环境和 Qwen 依赖时需要）
 - FFmpeg（加入 PATH 即可；或把 ffmpeg.exe 放到 `.subfix_support\bin\ffmpeg.exe`）
 
-Windows 轻量包不内置 Python 运行时与 FFmpeg（macOS 完整包内置），这两项由系统提供。
+Windows 轻量包不内置 Python 运行时与 FFmpeg，这两项由系统提供。
 缺失时插件会给出明确报错，按提示安装后重试。
 
 ## 安装
@@ -62,17 +62,15 @@ Windows 轻量包不内置 Python 运行时与 FFmpeg（macOS 完整包内置）
    `...\Scripts\Utility\.subfix_support\setup_asr_env.cmd` 安装识别依赖
    （走清华 PyPI 镜像，失败自动回退官方源）。
 
-## 与 macOS 版的差异
+## 平台实现说明
 
-- 字幕轨 UI 自动切换（activate_subtitle_target_track_via_ui）在上游 macOS 版也只有定义、没有调用，
-  属于未接线的辅助代码；实际目标轨由插件 UI 的轨道下拉框经 Resolve API（mediaPool:AppendToTimeline 等）
-  控制，Windows 上无功能损失，无需替代实现。
-- 在线更新已停用（macOS 更新器只会下载 mac 资产）；请到 GitHub Releases 手动更新。
-- 强制对齐加速：上游 qwen3-asr.cpp 无官方 Windows 构建，Windows 版用 MinGW-w64 自编译
+- 字幕目标轨由插件 UI 的轨道下拉框经 Resolve API（mediaPool:AppendToTimeline 等）控制。
+- 在线更新已停用；请到 GitHub Releases 手动更新。
+- 强制对齐加速：qwen3-asr.cpp 无官方 Windows 构建，本分支用 MinGW-w64 自编译
   （`dist` 的 Max 包已内置 qwen3-asr-cli 与对齐 GGUF）；轻量/Full 包识别走 Python 环境（qwen-asr），
   结果一致、速度略慢。
 - 后台任务通过 cmd 批处理 + PowerShell 记录 PID，取消按钮用 taskkill 终止进程树。
-- 安装/卸载为 bat 脚本与 Inno Setup 安装器，对应 macOS 的 pkg 与卸载 command。
+- 安装/卸载为 bat 脚本与 Inno Setup 安装器。
 
 ## 复用本机已有模型
 

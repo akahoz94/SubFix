@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe GitHub Release updater for the macOS SubFix Resolve scripts."""
+"""GitHub Release 更新检查助手（Windows 发行版：在线更新已停用，仅保留接口）。"""
 
 from __future__ import annotations
 
@@ -276,7 +276,7 @@ def write_progress(path: Path | None, payload: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     if os.name == "nt":
-        # Windows 发布包与 macOS 不同，在线更新只会拿到 mac 资产；请到 GitHub Releases 手动更新。
+        # Windows 发行版在线更新已停用；请到 GitHub Releases 手动更新。
         print("Windows 版暂不支持在线更新，请到 GitHub Releases 手动下载安装。", file=sys.stderr)
         return 1
     parser = argparse.ArgumentParser(description="SubFix GitHub Release 更新器")

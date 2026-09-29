@@ -388,57 +388,7 @@ function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
         return nil
     end
 
-    -- JXA 的返回值写入 stdout；console.log 写入 stderr，会被下面的重定向丢弃。
-    local jxa = [[(function () {
-    ObjC.import("AppKit");
-    ObjC.import("CoreGraphics");
-    const screens = $.NSScreen.screens;
-    const primary = screens.objectAtIndex(0);
-    const desktopTop = Number(primary.frame.origin.y) + Number(primary.frame.size.height);
-    function screenRect(frame) {
-        return {x: Number(frame.origin.x),
-            y: desktopTop - Number(frame.origin.y) - Number(frame.size.height),
-            width: Number(frame.size.width), height: Number(frame.size.height)};
-    }
-    let selected = primary;
-    let mainWindow = null;
-    let largestArea = 0;
-    try {
-        const raw = $.CGWindowListCopyWindowInfo(17, 0);
-        const windows = ObjC.deepUnwrap(ObjC.castRefToObject(raw));
-        for (const window of windows) {
-            if (!/^(DaVinci Resolve|Resolve)$/i.test(String(window.kCGWindowOwnerName || ""))
-                || Number(window.kCGWindowLayer) !== 0 || Number(window.kCGWindowAlpha) === 0) continue;
-            const bounds = window.kCGWindowBounds;
-            const area = bounds ? Number(bounds.Width) * Number(bounds.Height) : 0;
-            if (area > largestArea) { largestArea = area; mainWindow = bounds; }
-        }
-    } catch (error) {
-        // Window information may be unavailable; retain the primary display fallback.
-    }
-    if (mainWindow) {
-        let largestOverlap = 0;
-        for (let i = 0; i < Number(screens.count); i++) {
-            const screen = screens.objectAtIndex(i);
-            const rect = screenRect(screen.frame);
-            const overlapWidth = Math.max(0, Math.min(rect.x + rect.width, Number(mainWindow.X) + Number(mainWindow.Width)) - Math.max(rect.x, Number(mainWindow.X)));
-            const overlapHeight = Math.max(0, Math.min(rect.y + rect.height, Number(mainWindow.Y) + Number(mainWindow.Height)) - Math.max(rect.y, Number(mainWindow.Y)));
-            const overlap = overlapWidth * overlapHeight;
-            if (overlap > largestOverlap) { largestOverlap = overlap; selected = screen; }
-        }
-    }
-    const visible = screenRect(selected.visibleFrame);
-    return [visible.x, visible.y, visible.width, visible.height].join(",");
-})();]]
-    local escaped = jxa:gsub("'", "'\\\"'\\\"'")
-    local pipe = io.popen("/usr/bin/osascript -l JavaScript -e '" .. escaped .. "' 2>/dev/null", "r")
-    if not pipe then return nil end
-    local output = pipe:read("*a") or ""
-    pipe:close()
-    local x, y, width, height = output:match("^%s*([%-%.%d]+),([%-%.%d]+),([%-%.%d]+),([%-%.%d]+)%s*$")
-    x, y, width, height = tonumber(x), tonumber(y), tonumber(width), tonumber(height)
-    if not x or not y or not width or not height or width <= 0 or height <= 0 then return nil end
-    return {x = x, y = y, width = width, height = height}
+    return nil
 end
 
 function SUBFIX_WINDOW_GEOMETRY.centered_geometry(fallback_geometry)

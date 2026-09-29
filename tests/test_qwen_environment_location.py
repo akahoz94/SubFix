@@ -46,10 +46,6 @@ class EnvironmentLocationTests(unittest.TestCase):
             self.assertIn('"-B"', body)
 
     def test_real_local_pip_install_does_not_modify_script_tree(self):
-        if os.name != "nt":
-            # macOS：base_python 指向 root/runtime 内解释器，需在隔离目录建软链指向真实解释器
-            self.paths.base_python.parent.mkdir(parents=True)
-            self.paths.base_python.symlink_to(sys.executable)
         # Windows 轻量布局 base_python 回退当前解释器（sys.executable 已存在），无需软链
         before = {str(p.relative_to(self.paths.root)) for p in self.paths.root.rglob("*")}
         wheel = self.root / "subfix_path_probe-0.0.0-py3-none-any.whl"
