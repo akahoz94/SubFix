@@ -98,7 +98,7 @@ def test_oom_halves_batch_and_retries_once(fake_torch, monkeypatch):
     fake_torch(8.0)
     oom = _FakeTorch(0).cuda.OutOfMemoryError("CUDA out of memory")
     calls = []
-    def fake_transcribe(qwen_model, audio, language, context):
+    def fake_transcribe(qwen_model, audio, language, context, **kwargs):
         calls.append(qwen_model.max_inference_batch_size)
         if len(calls) == 1:
             raise oom
@@ -117,7 +117,7 @@ def test_oom_at_batch_one_does_not_retry(fake_torch, monkeypatch):
     fake_torch(0.1)
     calls = []
     oom = _FakeTorch(0).cuda.OutOfMemoryError("CUDA out of memory")
-    def fake_transcribe(qwen_model, audio, language, context):
+    def fake_transcribe(qwen_model, audio, language, context, **kwargs):
         calls.append(qwen_model.max_inference_batch_size)
         raise oom
     monkeypatch.setattr(mod, "_transcribe_qwen3_model", fake_transcribe)
@@ -131,7 +131,7 @@ def test_non_oom_error_is_not_retried(fake_torch, monkeypatch):
     monkeypatch.delenv("SUBFIX_QWEN3_ASR_MAX_BATCH", raising=False)
     fake_torch(8.0)
     calls = []
-    def fake_transcribe(qwen_model, audio, language, context):
+    def fake_transcribe(qwen_model, audio, language, context, **kwargs):
         calls.append(qwen_model.max_inference_batch_size)
         raise ValueError("普通错误")
     monkeypatch.setattr(mod, "_transcribe_qwen3_model", fake_transcribe)

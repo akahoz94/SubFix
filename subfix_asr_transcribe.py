@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from types import SimpleNamespace
 import wave
 from collections import Counter
 from pathlib import Path
@@ -3933,6 +3934,19 @@ def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
     # PyTorch 缓存池会把驱动空闲压到 1GB 以下，批大小分档会永远落进保命档。
     _read_free_gb_before_model_load()
 
+    # 两阶段架构下 ASR 走 return_time_stamps=False，库内切块上限从 180s 放大到
+    # MAX_ASR_INPUT_SECONDS=1200——380s 音频进单 chunk 后输出被 max_new_tokens=512
+    # 截断（实测丢窗 8-9）。这里钉回 180s，与 timestamps 模式同切块语义。
+    try:
+        from qwen_asr.inference import utils as _qwen_qa_utils
+        if int(getattr(_qwen_qa_utils, "MAX_ASR_INPUT_SECONDS", 180)) > 180:
+            _qwen_qa_utils.MAX_ASR_INPUT_SECONDS = 180
+            from qwen_asr.inference import qwen3_asr as _qwen3_asr_module
+            if getattr(_qwen3_asr_module, "MAX_ASR_INPUT_SECONDS", 180) > 180:
+                _qwen3_asr_module.MAX_ASR_INPUT_SECONDS = 180
+    except Exception:
+        pass
+
     chunk_seconds = os.getenv("SUBFIX_FORCE_ALIGN_CHUNK_SECONDS")
     if chunk_seconds:
         try:
@@ -3956,12 +3970,11 @@ def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
         # 手动 env 值在两处都生效。
         "max_inference_batch_size": int(os.getenv("SUBFIX_QWEN3_ASR_MAX_BATCH") or "1"),
         "max_new_tokens": int(os.getenv("SUBFIX_QWEN3_ASR_MAX_NEW_TOKENS") or "512"),
-        "forced_aligner": aligner_name,
-        "forced_aligner_kwargs": {"device_map": device_map},
+        # 两阶段架构：ASR 模型不带对齐器加载（省 1.2GB 驻留，给批内激活腾预算），
+        # 对齐由 load_qwen3_forced_aligner() 的独立实例在文本阶段后显式执行。
     }
     if dtype is not None:
         init_kwargs["dtype"] = dtype
-        init_kwargs["forced_aligner_kwargs"]["dtype"] = dtype
 
     cache_key = (model_name, aligner_name, device_map, str(dtype))
     try:
@@ -4125,11 +4138,14 @@ def _apply_auto_batch_size(qwen_model: Any) -> None:
 
 
 def _transcribe_with_oom_retry(
-    qwen_model: Any, audio: str | list[str], language: str | None, context: str | None
+    qwen_model: Any, audio: str | list[str], language: str | None, context: str | None,
+    return_time_stamps: bool = True,
 ) -> tuple[Any, str]:
     _apply_auto_batch_size(qwen_model)
     try:
-        return _transcribe_qwen3_model(qwen_model, audio, language, context)
+        return _transcribe_qwen3_model(
+            qwen_model, audio, language, context, return_time_stamps=return_time_stamps
+        )
     except Exception as exc:
         current = int(getattr(qwen_model, "max_inference_batch_size", 1) or 1)
         if current <= 1 or not _is_cuda_oom(exc):
@@ -4149,12 +4165,13 @@ def _transcribe_with_oom_retry(
 
 
 def _transcribe_qwen3_model(
-    qwen_model: Any, audio: str | list[str], language: str | None, context: str | None
+    qwen_model: Any, audio: str | list[str], language: str | None, context: str | None,
+    return_time_stamps: bool = True,
 ) -> tuple[Any, str]:
     kwargs: dict[str, Any] = {
         "audio": audio,
         "language": qwen3_language_name(language),
-        "return_time_stamps": True,
+        "return_time_stamps": return_time_stamps,
     }
     if not context:
         return qwen_model.transcribe(**kwargs), "not_requested"
@@ -4171,41 +4188,106 @@ def _transcribe_qwen3_model(
 def transcribe_qwen3_asr(
     audio_path: Path, model: str, language: str | None, context: str | None = None
 ) -> dict[str, Any]:
-    qwen_model, model_name, aligner_name, device_map = load_qwen3_asr_model(model)
-    try:
-        results, hotword_context_status = _transcribe_with_oom_retry(
-            qwen_model, str(audio_path), language, context
-        )
-    except Exception as exc:  # pragma: no cover - depends on optional local setup/model cache
-        raise RuntimeError(f"Qwen3-ASR 转写失败: {exc}") from exc
-    first_result = results[0] if isinstance(results, list) and results else results
-    return qwen3_result_to_payload(
-        first_result, audio_path, model, model_name, aligner_name, device_map, hotword_context_status
-    )
+    return transcribe_qwen3_asr_batch([audio_path], model, language, context)[0]
+
+
+_ALIGN_CHUNK_SECONDS = 180
 
 
 def transcribe_qwen3_asr_batch(
     audio_paths: list[Path], model: str, language: str | None, context: str | None = None
 ) -> list[dict[str, Any]]:
+    """两阶段 Qwen3-ASR：块级纯文本 ASR + 独立对齐器显式对齐。
+
+    与库内 transcribe(return_time_stamps=True) 同语义（normalize→180s 低能量
+    切块→块级 ASR→块音频配块文本对齐→offset 修正合并），但两个模型分时驻留：
+    ASR 阶段无对齐器的 1.2GB，批内激活预算更大；对齐阶段 ASR 权重的缓存可被
+    部分复用，峰值显存更低。块文本来自 ASR 阶段自身（切块对齐必须块对块，
+    喂全文会导致每块重复对齐全文——实测对齐项膨胀 3 倍、时间轴越界）。
+    """
     if not audio_paths:
         return []
+    from qwen_asr.inference.qwen3_forced_aligner import ForcedAlignResult
+    from qwen_asr.inference.utils import normalize_audios, split_audio_into_chunks
+
     qwen_model, model_name, aligner_name, device_map = load_qwen3_asr_model(model)
     try:
+        wavs = normalize_audios([str(path) for path in audio_paths])
+    except Exception as exc:  # pragma: no cover - depends on optional local setup
+        raise RuntimeError(f"Qwen3-ASR 音频读取失败: {exc}") from exc
+
+    chunk_owners: list[int] = []
+    chunk_offsets: list[float] = []
+    chunk_audios: list[tuple[Any, int]] = []
+    for owner, wav in enumerate(wavs):
+        for chunk_wav, offset_sec in split_audio_into_chunks(wav, 16000, _ALIGN_CHUNK_SECONDS):
+            chunk_owners.append(owner)
+            chunk_offsets.append(float(offset_sec))
+            chunk_audios.append((chunk_wav, 16000))
+
+    # 阶段 1：块级纯文本 ASR——无对齐器驻留，批内激活预算更大
+    try:
         results, hotword_context_status = _transcribe_with_oom_retry(
-            qwen_model, [str(path) for path in audio_paths], language, context
+            qwen_model, chunk_audios, language, context, return_time_stamps=False
         )
     except Exception as exc:  # pragma: no cover - depends on optional local setup/model cache
         raise RuntimeError(f"Qwen3-ASR 批量转写失败: {exc}") from exc
     if not isinstance(results, list):
         results = [results]
-    if len(results) != len(audio_paths):
-        raise RuntimeError(f"Qwen3-ASR 批量结果数量不匹配: audio={len(audio_paths)} result={len(results)}")
-    return [
-        qwen3_result_to_payload(
-            result, audio_path, model, model_name, aligner_name, device_map, hotword_context_status
+    if len(results) != len(chunk_audios):
+        raise RuntimeError(f"Qwen3-ASR 批量结果数量不匹配: chunks={len(chunk_audios)} result={len(results)}")
+
+    chunk_texts = [str(getattr(result, "text", "") or "") for result in results]
+    chunk_langs = [str(getattr(result, "language", "") or "Chinese") for result in results]
+
+    # 阶段 2：独立对齐器，块音频配块文本
+    non_empty = [i for i, text in enumerate(chunk_texts) if text.strip()]
+    align_results: list[Any | None] = [None] * len(chunk_audios)
+    if non_empty:
+        try:
+            aligner = load_qwen3_forced_aligner()
+            aligned = aligner.align(
+                audio=[chunk_audios[i] for i in non_empty],
+                text=[chunk_texts[i] for i in non_empty],
+                language=[chunk_langs[i] for i in non_empty],
+            )
+        except Exception as exc:  # pragma: no cover - depends on optional local runtime
+            raise RuntimeError(f"Qwen3-ForcedAligner 对齐失败: {exc}") from exc
+        for i, result in zip(non_empty, aligned):
+            align_results[i] = result
+
+    # offset 修正 + 按窗合并（复刻库内 _offset_align_result/_merge_align_results）
+    window_items: dict[int, list[Any]] = {}
+    for index, (owner, offset) in enumerate(zip(chunk_owners, chunk_offsets)):
+        result = align_results[index]
+        if result is None:
+            continue
+        for item in result.items:
+            window_items.setdefault(owner, []).append(
+                type(item)(
+                    text=item.text,
+                    start_time=round(item.start_time + offset, 3),
+                    end_time=round(item.end_time + offset, 3),
+                )
+            )
+
+    payloads: list[dict[str, Any]] = []
+    for owner, audio_path in enumerate(audio_paths):
+        items = window_items.get(owner) or []
+        items.sort(key=lambda item: item.start_time)
+        asr_texts = [chunk_texts[i] for i in range(len(chunk_audios)) if chunk_owners[i] == owner]
+        asr_langs = [chunk_langs[i] for i in range(len(chunk_audios)) if chunk_owners[i] == owner]
+        pseudo_result = SimpleNamespace(
+            text="".join(asr_texts),
+            language=asr_langs[0] if asr_langs else None,
+            time_stamps=ForcedAlignResult(items=items) if items else None,
         )
-        for result, audio_path in zip(results, audio_paths)
-    ]
+        payloads.append(
+            qwen3_result_to_payload(
+                pseudo_result, audio_path, model, model_name, aligner_name, device_map, hotword_context_status
+            )
+        )
+    return payloads
 
 
 def _doubao_credentials_path() -> Path:

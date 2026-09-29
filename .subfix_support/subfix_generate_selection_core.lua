@@ -995,6 +995,64 @@ local function temp_dir()
     return root
 end
 
+-- 文稿关键词 → ASR 热词偏置：文稿非空时把文稿切出的关键词并入热词条目，
+-- 与用户手动热词一起经 --hotwords-json 传给 ASR。分隔符与 SubFix.lua 的
+-- split_reference_script_keywords 一致；超长行（整段文稿）不算关键词，
+-- 避免整句进入"专有名词"偏置上下文。去重与 200 条上限由 Python 侧
+-- load_hotword_entries / HOTWORD_MAX_ENTRIES 统一兜底（手动热词在前，优先保留）。
+local HOTWORD_SCRIPT_TERM_MAX_CHARS = 36
+
+local function count_utf8_chars(text)
+    local _, count = tostring(text or ""):gsub("[^\128-\191]", "")
+    return count
+end
+
+local function split_script_hotword_terms(script_text)
+    local normalized = tostring(script_text or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+    for _, delimiter in ipairs({",", "，", "、", ";", "；"}) do
+        normalized = normalized:gsub(delimiter, "\n")
+    end
+    local terms, seen_terms = {}, {}
+    for line in (normalized .. "\n"):gmatch("(.-)\n") do
+        local term = trim_text(line)
+        if term ~= "" and count_utf8_chars(term) <= HOTWORD_SCRIPT_TERM_MAX_CHARS and not seen_terms[term] then
+            seen_terms[term] = true
+            terms[#terms + 1] = term
+        end
+    end
+    return terms
+end
+
+local function build_script_hotwords_json(script_text, user_hotwords_json)
+    local terms = split_script_hotword_terms(script_text)
+    if #terms == 0 then return nil end
+    local parts = {}
+    if user_hotwords_json and file_exists(user_hotwords_json) then
+        -- user_hotwords_json 即 resolve_asr_paths().hotwords，仅在热词开关打开时非 nil
+        for _, entry in ipairs(load_generate_hotword_entries()) do
+            local aliases = {}
+            for _, alias in ipairs(entry.aliases or {}) do
+                aliases[#aliases + 1] = '"' .. json_escape(alias) .. '"'
+            end
+            parts[#parts + 1] = string.format(
+                '{"term":"%s","aliases":[%s]}',
+                json_escape(entry.term),
+                table.concat(aliases, ",")
+            )
+        end
+    end
+    for _, term in ipairs(terms) do
+        parts[#parts + 1] = string.format('{"term":"%s","aliases":[]}', json_escape(term))
+    end
+    local path = temp_dir() .. "/SubFix_Hotwords_Script_"
+        .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
+    if not write_text_file(path, '{"version":1,"entries":[' .. table.concat(parts, ",") .. "]}\n") then
+        return nil
+    end
+    print(string.format("[SubFix Generate] 文稿关键词已并入热词偏置: 新增 %d 条", #terms))
+    return path
+end
+
 local function parse_fps(value)
     local text = tostring(value or "")
     if text == "29.97" then return 30000 / 1001 end
@@ -4525,6 +4583,16 @@ local function generate_selection_subtitles()
     if write_selected_audio_source_diagnostic(audio_diag_path, selected_audio_sources, scope, source_optimization) then
         print("[SubFix Generate] 已写入音频源诊断: " .. audio_diag_path)
     end
+    -- 文稿校对联动：文稿非空时把文稿关键词并入热词，一并经 --hotwords-json 传给 ASR。
+    -- 临时合并文件在识别结束（含豆包重试循环）后删除，失败残留同其他临时文件。
+    local script_hotwords_json = nil
+    local script_file_for_asr = tostring(runtime_options and runtime_options.script_file_path or "")
+    if script_file_for_asr ~= "" and file_exists(script_file_for_asr) then
+        script_hotwords_json = build_script_hotwords_json(read_text_file(script_file_for_asr) or "", hotwords_json)
+        if script_hotwords_json then
+            hotwords_json = script_hotwords_json
+        end
+    end
     local helper_ok, helper_err, helper_status = run_asr_helper_batch_with_progress(
         batch_plan_path,
         srt_path,
@@ -4578,6 +4646,7 @@ local function generate_selection_subtitles()
         finish_generate_progress_window(progress_state, helper_status == "cancelled" and "已取消" or "失败", helper_err)
         error(helper_err)
     end
+    if script_hotwords_json then pcall(subfix_remove_files, script_hotwords_json) end
 
     local function cancel_postprocess_if_requested(should_continue)
         if should_continue then return end
