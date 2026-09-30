@@ -5686,59 +5686,89 @@ def try_script_direct_subtitles(
         reasons.append("AUDIO_FILE_MISSING")
         return None
     fps = float(batch.get("fps") or 30.0)
-    duration = audio_duration_seconds(audio_path)
-    if duration <= 0.0:
-        reasons.append("AUDIO_DURATION_UNKNOWN")
-        return None
-    if duration > script_direct.DIRECT_MAX_AUDIO_SECONDS:
-        reasons.append("AUDIO_TOO_LONG_FOR_DIRECT_ALIGNMENT")
-        return None
-
-    write_progress(
-        progress_path, "script_direct", "文稿直出：整段对齐中",
-        batch_index=0, total_batches=1, progress_index=20, progress_total=100,
-    )
-    try:
-        aligner = load_qwen3_forced_aligner()
-        from qwen_asr.inference.utils import normalize_audios
-        waveform = normalize_audios([str(audio_path)])[0]
-        results = aligner.align(
-            audio=[(waveform, 16000)],
-            text=[script_text],
-            language=[qwen3_language_name(getattr(args, "language", None)) or "Chinese"],
-        )
-        alignment = results[0] if isinstance(results, list) and results else results
-    except Exception as exc:
-        reasons.append(f"DIRECT_EXCEPTION:{type(exc).__name__}")
-        diagnostic_note = str(exc)[:200]
-        args._direct_fail_detail = diagnostic_note
-        return None
-
-    tokens = [
-        {"text": str(item.text), "start": float(item.start_time), "end": float(item.end_time)}
-        for item in getattr(alignment, "items", []) or []
-    ]
-    mapping = script_direct.map_aligned_tokens_to_lines(
-        tokens, lines, language=qwen3_language_name(getattr(args, "language", None)) or "Chinese",
-    )
-    quality = script_direct.evaluate_direct_quality(
-        tokens, mapping, line_count=len(lines), duration=duration,
-    )
-    if not quality.passed:
-        reasons.extend(quality.reasons)
-        return None
-
     track_index = int(batch.get("track_index") or 0)
     timeline_start_frame = int(batch.get("timeline_start_frame") or 0)
-    rows = script_direct.build_direct_rows(mapping, fps=fps, speaker_track_index=track_index)
+
+    # 与常规转录路径一致：batch["audio"] 是整条素材，选区靠 ffmpeg 按 source_start/end 截。
+    # 直接对齐整条素材会让时长、质量门跨度、帧号全部按整条素材算，
+    # 回填时又被核心层的选区 scope 裁剪，结果是「一行都写不进去」。
+    work_dir = Path(tempfile.mkdtemp(prefix="subfix_script_direct_"))
+    cut_path = work_dir / "direct_selection.wav"
     try:
-        refined, _refine_diag = generate_v5.refine_subtitle_boundaries(
-            rows, audio_path, timeline_start_frame, fps,
+        try:
+            cut_audio(
+                resolve_ffmpeg(getattr(args, "ffmpeg", None)),
+                audio_path,
+                cut_path,
+                float(batch.get("source_start") or 0.0),
+                float(batch["source_end"]) if batch.get("source_end") is not None else None,
+                int(batch["audio_channel_index"]) if batch.get("audio_channel_index") else None,
+            )
+        except Exception as exc:
+            reasons.append(f"DIRECT_CUT_FAILED:{type(exc).__name__}")
+            args._direct_fail_detail = str(exc)[:200]
+            return None
+
+        duration = audio_duration_seconds(cut_path)
+        if duration <= 0.0:
+            reasons.append("AUDIO_DURATION_UNKNOWN")
+            return None
+        if duration > script_direct.DIRECT_MAX_AUDIO_SECONDS:
+            reasons.append("AUDIO_TOO_LONG_FOR_DIRECT_ALIGNMENT")
+            return None
+
+        write_progress(
+            progress_path, "script_direct", "文稿直出：整段对齐中",
+            batch_index=0, total_batches=1, progress_index=20, progress_total=100,
         )
-        refined, _conflicts = generate_v5.preserve_refined_row_order(refined)
-        rows = refined
-    except Exception:
-        pass  # 直出行边界已由对齐决定，refine 只是锦上添花
+        try:
+            aligner = load_qwen3_forced_aligner()
+            from qwen_asr.inference.utils import normalize_audios
+            waveform = normalize_audios([str(cut_path)])[0]
+            results = aligner.align(
+                audio=[(waveform, 16000)],
+                text=[script_text],
+                language=[qwen3_language_name(getattr(args, "language", None)) or "Chinese"],
+            )
+            alignment = results[0] if isinstance(results, list) and results else results
+        except Exception as exc:
+            reasons.append(f"DIRECT_EXCEPTION:{type(exc).__name__}")
+            diagnostic_note = str(exc)[:200]
+            args._direct_fail_detail = diagnostic_note
+            return None
+
+        tokens = [
+            {"text": str(item.text), "start": float(item.start_time), "end": float(item.end_time)}
+            for item in getattr(alignment, "items", []) or []
+        ]
+        mapping = script_direct.map_aligned_tokens_to_lines(
+            tokens, lines, language=qwen3_language_name(getattr(args, "language", None)) or "Chinese",
+        )
+        quality = script_direct.evaluate_direct_quality(
+            tokens, mapping, line_count=len(lines), duration=duration,
+        )
+        if not quality.passed:
+            reasons.extend(quality.reasons)
+            return None
+
+        rows = script_direct.build_direct_rows(
+            mapping,
+            fps=fps,
+            timeline_start_frame=timeline_start_frame,
+            speaker_track_index=track_index or 1,
+            max_chars=getattr(args, "max_chars", None),
+            text_length=generated_subtitle_text_length,
+        )
+        try:
+            refined, _refine_diag = generate_v5.refine_subtitle_boundaries(
+                rows, cut_path, timeline_start_frame, fps,
+            )
+            refined, _conflicts = generate_v5.preserve_refined_row_order(refined)
+            rows = refined
+        except Exception:
+            pass  # 直出行边界已由对齐决定，refine 只是锦上添花
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     write_progress(
         progress_path, "write_output", "文稿直出完成",
@@ -5758,6 +5788,8 @@ def try_script_direct_subtitles(
             "script_direct": {
                 "path": "direct",
                 "line_count": len(lines),
+                "row_count": len(rows),
+                "max_chars": getattr(args, "max_chars", None),
                 "unique_interval_ratio": round(quality.unique_interval_ratio, 4),
                 "aligned_span_ratio": round(quality.aligned_span_ratio, 4),
                 "intervals": {

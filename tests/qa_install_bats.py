@@ -17,7 +17,8 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ZIP = ROOT / "dist" / "SubFix-v3.4.0-Windows.zip"
+from qa_dist import resolve_zip  # 版本写死会让 QA 解压旧包（曾长期测 3.4.0）
+ZIP = resolve_zip()
 BAT_INSTALL = "安装_SubFix.bat"
 BAT_UNINSTALL = "卸载_SubFix.bat"
 DEST = Path.home() / "AppData/Roaming/Blackmagic Design/DaVinci Resolve/Support/Fusion/Scripts/Utility"
@@ -59,6 +60,24 @@ def _chinese_ok(text, name):
     else:
         keys = ["使用 Python", "ASR 环境已安装", "未找到 Python"]
     return all(k in text for k in keys)
+
+
+# ---------- 0. 用户环境搬迁保护：卸载演练会真删 %APPDATA%\SubFix\envs（数 GB 依赖） ----------
+import shutil as _shutil
+_HOME = Path.home()
+_USER_ENVS = _HOME / "AppData/Roaming/SubFix/envs"
+_ENVS_PARK = Path(tempfile.mkdtemp(prefix="subfix_qa_envs_park_")) / "envs"
+if _USER_ENVS.is_dir():
+    _shutil.move(str(_USER_ENVS), str(_ENVS_PARK))
+    print(f"== 0. 已搬迁用户 qwen 环境 -> {_ENVS_PARK}（演练后恢复） ==")
+
+
+def _restore_user_envs():
+    if _ENVS_PARK.is_dir():
+        if _USER_ENVS.exists():
+            _shutil.rmtree(str(_USER_ENVS), ignore_errors=True)
+        _shutil.move(str(_ENVS_PARK), str(_USER_ENVS))
+        print("== 用户 qwen 环境已恢复 ==")
 
 
 # ---------- 1. 仓库内静态审计 ----------
@@ -164,8 +183,20 @@ rc, out = run_bat(BAT_UNINSTALL, "UNINSTALL\n")  # 空卸载（已无文件）
 assert_clean_output("空卸载", out)
 check("空卸载: 不报错完成", "卸载完成" in out)
 
+# ---------- 5. 现场恢复：演练在真实 DEST 上删除了插件，演练后必须重新部署 ----------
+print("== 5. 演练后恢复（重解压最新 zip 到 DEST） ==")
+if ZIP.is_file():
+    import zipfile as _zip
+    with _zip.ZipFile(ZIP) as _z:
+        _z.extractall(DEST)
+    check("演练后恢复: SubFix.lua 已重新部署", (DEST / "SubFix/SubFix.lua").is_file())
+    check("演练后恢复: .subfix_support 已重新部署", (DEST / ".subfix_support").is_dir())
+else:
+    check("演练后恢复: zip 存在", False, str(ZIP))
 print()
 if failures:
     print(f"共 {len(failures)} 项失败: {failures}")
+    _restore_user_envs()
     sys.exit(1)
+_restore_user_envs()
 print("QA 全部通过")

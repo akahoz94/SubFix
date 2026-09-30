@@ -8,6 +8,7 @@
 zip 用 python zipfile 写入:中文文件名带 UTF-8(EFS) 标志,各解压工具不乱码。
 """
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,7 @@ ROOT_PY = [
     "subfix_generate_textnorm.py",
     "subfix_silero_vad.py",
     "subfix_script_proofread.py",
+    "subfix_script_direct.py",
 ]
 SUPPORT_FILES = [
     "subfix_generate_selection_core.lua",
@@ -161,9 +163,22 @@ def build_stage(version: str, bundle_runtime: bool, qwen_cpp: Path | None = None
     return stage, notes
 
 
+def read_plugin_version() -> str:
+    """版本号只认 SubFix.lua 的 SUBFIX_VERSION。
+
+    这里原来写死 default="3.3.0"：不带 --version 打包就悄悄产出 3.3.0 的包，
+    包内脚本却是最新代码，文件名与包内版本双双失真。
+    """
+    text = (ROOT / "SubFix.lua").read_text(encoding="utf-8", errors="replace")
+    match = re.search(r'SUBFIX_VERSION\s*=\s*"([^"]+)"', text)
+    if not match:
+        raise SystemExit("SubFix.lua 里找不到 SUBFIX_VERSION，无法确定打包版本号")
+    return match.group(1)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="3.3.0")
+    parser.add_argument("--version", default=read_plugin_version())
     parser.add_argument("--bundle-runtime", action="store_true",
                         help="内置 Python 运行时与 ffmpeg（Full 包）")
     parser.add_argument("--installer", action="store_true",

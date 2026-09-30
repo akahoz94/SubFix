@@ -41,6 +41,33 @@ def test_perfect_verbatim_passes_gate_and_builds_rows():
     assert rows[0]["timing_decision"] == "script_direct"
 
 
+def clamp_to_scope(rows, scope_start, scope_end):
+    """复刻核心层 merge_generated_rows_for_writeback 的选区裁剪。"""
+    kept = []
+    for row in rows:
+        start = max(row["start_frame"], scope_start)
+        end = min(row["end_frame"], scope_end)
+        if end > start:
+            kept.append((start, end))
+    return kept
+
+
+def test_direct_rows_offset_by_timeline_start_frame():
+    """达芬奇时间线默认从 01:00:00:00 起。直出行若不叠加这个起点，
+    相对帧号(0 起)整体落在选区之前，被核心层裁成 end<=start，字幕一行也写不回去。"""
+    lines = sd.parse_reference_lines(SCRIPT)
+    tokens, _ = verbatim_tokens([line.text for line in lines], start=1.0, per_line=2.0, gap=1.0)
+    mapping = sd.map_aligned_tokens_to_lines(tokens, lines, language="Chinese")
+    base = 108000  # 01:00:00:00 @ 30fps
+    rows = sd.build_direct_rows(mapping, fps=30.0, timeline_start_frame=base)
+    assert rows[0]["start_frame"] == base + 30 and rows[0]["end_frame"] == base + 90
+
+    scope_end = base + int(8.0 * 30)
+    assert clamp_to_scope(rows, base, scope_end), "加起点后应仍有可写回行"
+    assert clamp_to_scope(sd.build_direct_rows(mapping, fps=30.0), base, scope_end) == [], \
+        "漏传起点必须复现『全被裁光』的故障，否则这条回归没守住"
+
+
 def test_half_spoken_script_fails_gate():
     lines = sd.parse_reference_lines(SCRIPT)
     # 只念了第一行：后两行无对齐覆盖
@@ -104,3 +131,69 @@ def test_locally_collapsed_line_flagged():
     assert not quality.passed
     assert "LOCALLY_COLLAPSED_SCRIPT_INTERVALS" in quality.reasons
     assert quality.locally_collapsed_line_indices == (1,)
+
+
+LONG_LINE = (
+    "大家好欢迎来到本期节目今天我们聊聊短视频的字幕到底应该做多长才算合适"
+    "太长了观众读不完太短了又要频繁切屏真的很考验节奏感谢谢观看下期再见"
+)
+
+
+def test_split_keeps_text_lossless_and_within_cap():
+    for cap in (10, 12, 25):
+        pieces = sd.split_text_to_max_chars(LONG_LINE, cap)
+        assert "".join(pieces) == LONG_LINE
+        assert all(sd.default_text_length(piece) <= cap for piece in pieces), pieces
+
+
+def test_split_prefers_punctuation_boundary():
+    text = "第一句讲完了。第二句也讲完了！第三句还有一点点没讲完所以被切开了"
+    pieces = sd.split_text_to_max_chars(text, 10)
+    assert "".join(pieces) == text
+    assert all(sd.default_text_length(p) <= 10 for p in pieces)
+    assert pieces[0] == "第一句讲完了。", pieces
+
+
+def test_split_never_cuts_english_word():
+    text = "DaVinci Resolve 20 里边的 subtitle 长度限制需要按词边界来切分"
+    pieces = sd.split_text_to_max_chars(text, 18)
+    assert "".join(pieces) == text
+    cursor = 0
+    for piece in pieces[:-1]:
+        cursor += len(piece)
+        before, after = text[cursor - 1], text[cursor]
+        assert not (before.isascii() and after.isascii() and before.isalnum() and after.isalnum()), \
+            f"切点落进英文词内部: ...{text[max(0, cursor - 10):cursor + 10]}..."
+
+
+def test_single_overlong_word_is_not_dropped():
+    text = "超短。" + "Internationalization" + "尾巴"
+    pieces = sd.split_text_to_max_chars(text, 5)
+    assert "".join(pieces) == text
+    assert any("Internationalization" in p for p in pieces)
+
+
+def test_build_direct_rows_splits_long_lines_and_keeps_frames_contiguous():
+    lines = sd.parse_reference_lines(LONG_LINE)
+    tokens = [{"text": LONG_LINE, "start": 0.0, "end": 20.0}]
+    mapping = sd.map_aligned_tokens_to_lines(tokens, lines, language="Chinese")
+    assert len(mapping.blocks) == 1
+    rows = sd.build_direct_rows(mapping, fps=30.0, timeline_start_frame=108000, max_chars=25,
+                                text_length=sd.default_text_length)
+    assert len(rows) > 1
+    assert all(sd.default_text_length(r["text"]) <= 25 for r in rows)
+    assert "".join(r["text"] for r in rows) == mapping.blocks[0].text
+    assert rows[0]["start_frame"] == 108000
+    assert rows[-1]["end_frame"] == 108000 + 600
+    for previous, current in zip(rows, rows[1:]):
+        assert current["start_frame"] == previous["end_frame"], (previous, current)
+        assert current["end_frame"] > current["start_frame"]
+    assert [r["index"] for r in rows] == list(range(1, len(rows) + 1))
+
+
+def test_build_direct_rows_without_cap_is_unchanged():
+    lines = sd.parse_reference_lines(SCRIPT)
+    tokens, _ = verbatim_tokens([line.text for line in lines])
+    mapping = sd.map_aligned_tokens_to_lines(tokens, lines, language="Chinese")
+    rows = sd.build_direct_rows(mapping, fps=30.0)
+    assert [row["text"] for row in rows] == [line.text for line in lines]

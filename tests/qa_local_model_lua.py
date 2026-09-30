@@ -116,6 +116,22 @@ except Exception as exc:
     sys.exit(1)
 
 g = lua.globals()
+
+# 生产路径的 mklink/rmdir 早已从 os.execute 换成 subfix_execute_hidden（FFI CreateProcessW 起 bat），
+# 只拦 os.execute 等于没拦：既记录不到命令（断言全假失败），还会真的在临时 home 里建 junction。
+# core 加载后覆盖同名全局，其余命令仍交给真实实现（与 os.execute 拦截同策略）。
+lua.execute("""
+local real_hidden = subfix_execute_hidden
+subfix_execute_hidden = function(cmd)
+    cmd = tostring(cmd or "")
+    if cmd:find("mklink /J", 1, true) or cmd:find("rmdir", 1, true) then
+        table.insert(EXECED, cmd)
+        return 0
+    end
+    if real_hidden then return real_hidden(cmd) end
+    return os.execute(cmd)
+end
+""")
 qa = g.__QA_EXPORT
 
 # ---------- 1. probe 命中真机模型 ----------

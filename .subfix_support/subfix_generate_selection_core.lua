@@ -313,7 +313,10 @@ function subfix_write_bg_batch(batch_file, cmd_line, options)
         "@echo off",
         "chcp 65001 >nul",
         'set "PYTHONHOME="',
-        'set "PYTHONPATH="'
+        'set "PYTHONPATH="',
+        -- 重定向后 Python 按 ANSI(GBK) 写 stderr，中文报错到 Lua 侧就是乱码，
+        -- 而 Lua 用 UTF-8 字节匹配「质量门/AUDIO_TOO_LONG」等关键字，匹配不上就给不出针对性提示
+        'set "PYTHONIOENCODING=utf-8"'
     }
     for _, pair in ipairs(options.env_pairs or {}) do
         lines[#lines + 1] = 'set "' .. tostring(pair.name) .. '=' .. tostring(pair.value) .. '"'
@@ -3477,46 +3480,6 @@ local function resolve_segmentation_profile_path(paths, engine)
     return nil
 end
 
-local function build_asr_helper_command(audio_source, srt_path, json_path, timeline_start_frame, fps, progress_path)
-    local paths = resolve_asr_paths()
-    if not file_exists(paths.helper) then
-        return nil, "缺少 ASR helper: " .. tostring(paths.helper)
-    end
-    if not file_exists(paths.python) then
-        return nil, "ASR 环境未安装，请先运行: " .. tostring(paths.setup)
-    end
-    local generate_engine = resolve_generate_engine()
-    local cmd_parts = {
-        shell_quote(paths.python),
-        shell_quote(paths.helper),
-        "--mode", "generate_subtitles",
-        "--backend", shell_quote(DEFAULT_ASR_BACKEND),
-        "--generate-engine", shell_quote(generate_engine),
-        "--audio", shell_quote(audio_source.file_path),
-        "--output", shell_quote(json_path),
-        "--srt-output", shell_quote(srt_path),
-        "--srt-base-frame", shell_quote(tostring(timeline_start_frame)),
-        "--timeline-start-frame", shell_quote(tostring(audio_source.start_frame)),
-        "--fps", shell_quote(tostring(fps)),
-        "--model", shell_quote(DEFAULT_ASR_MODEL),
-        "--language", shell_quote(DEFAULT_ASR_LANGUAGE),
-        "--progress-json", shell_quote(progress_path),
-        "--source-start", shell_quote(string.format("%.3f", tonumber(audio_source.source_start_seconds) or 0)),
-        "--source-end", shell_quote(string.format("%.3f", tonumber(audio_source.source_end_seconds) or 0))
-    }
-    local audio_channel_index = tonumber(audio_source.audio_channel_index)
-    if audio_channel_index and audio_channel_index > 0 then
-        cmd_parts[#cmd_parts + 1] = "--audio-channel-index"
-        cmd_parts[#cmd_parts + 1] = shell_quote(tostring(math.floor(audio_channel_index)))
-    end
-    local profile_path = resolve_segmentation_profile_path(paths, generate_engine)
-    if profile_path then
-        cmd_parts[#cmd_parts + 1] = "--segmentation-profile"
-        cmd_parts[#cmd_parts + 1] = shell_quote(profile_path)
-    end
-    return table.concat(cmd_parts, " "), nil
-end
-
 -- ========== 本机已有模型探测（免重复下载） ==========
 -- 候选顺序：环境变量（接入本地模型.bat / setx 写入）→ junction 数据目录 → 发行默认库 G:\AImodel。
 local function local_model_dir_complete(dir)
@@ -3932,28 +3895,6 @@ local function run_background_command_with_progress(cmd, progress_path, progress
         return false, "已取消", "cancelled"
     end
     return exit_code == 0, output, nil
-end
-
-local function run_asr_helper_with_progress(audio_source, srt_path, json_path, timeline_start_frame, fps, progress_state, source_index, source_count)
-    local progress_path = json_path .. ".progress.json"
-    local cmd, cmd_err = build_asr_helper_command(audio_source, srt_path, json_path, timeline_start_frame, fps, progress_path)
-    if not cmd then return false, cmd_err end
-    if source_index and source_count then
-        update_generate_progress_window(
-            progress_state,
-            {stage = string.format("识别 %d/%d", tonumber(source_index) or 0, tonumber(source_count) or 0), message = tostring(audio_source.file_name or audio_source.file_path or "")},
-            string.format("识别 %d/%d: %s", tonumber(source_index) or 0, tonumber(source_count) or 0, tostring(audio_source.file_name or audio_source.file_path or ""))
-        )
-    end
-    local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state, env_pairs)
-    subfix_remove_files(progress_path)
-    if not ok then
-        return false, tostring(output or "ASR helper 执行失败"), status
-    end
-    if not file_exists(srt_path) then
-        return false, "ASR helper 未生成 SRT"
-    end
-    return true
 end
 
 local function selected_sources_effective_audio_seconds(sources, fps)
@@ -4650,11 +4591,13 @@ local function generate_selection_subtitles()
             effective_audio_seconds
         )
     end
+    -- 合并热词的临时文件里含用户整段文稿，识别一结束（含失败/取消）就删，
+    -- 放在失败分支之后会让每次失败都在 %TEMP% 留一份文稿副本
+    if script_hotwords_json then pcall(subfix_remove_files, script_hotwords_json) end
     if not helper_ok then
         finish_generate_progress_window(progress_state, helper_status == "cancelled" and "已取消" or "失败", helper_err)
         error(helper_err)
     end
-    if script_hotwords_json then pcall(subfix_remove_files, script_hotwords_json) end
 
     local function cancel_postprocess_if_requested(should_continue)
         if should_continue then return end

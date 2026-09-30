@@ -13,7 +13,8 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ZIP = ROOT / "dist" / "SubFix-v3.4.0-Windows.zip"
+from qa_dist import resolve_zip  # 版本写死会让 QA 解压旧包（曾长期测 3.4.0）
+ZIP = resolve_zip()
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from lupa.luajit21 import LuaRuntime  # noqa: E402

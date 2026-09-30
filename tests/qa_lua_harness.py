@@ -15,7 +15,8 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ZIP = ROOT / "dist" / "SubFix-v3.4.0-Windows.zip"
+from qa_dist import resolve_zip  # 版本写死会让 QA 解压旧包（曾长期测 3.4.0）
+ZIP = resolve_zip()
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from lupa.luajit21 import LuaRuntime  # noqa: E402
@@ -164,6 +165,40 @@ if pid.isdigit():
     after = run_capture(["tasklist", "/FI", f"PID eq {pid}"])
     check("kill_tree: cmd.exe 已被终止", pid not in after, after[:150])
     check("kill_tree: 子进程被连带终止（done 未写出）", not done_marker.exists())
+
+# ---------- 7. 完整版入口：运行日志 / 重做 ----------
+# 这两个入口以前根本不存在（日志窗口整套代码没人调，重做引擎没有按钮），
+# 这里真调一次事件绑定 + 模拟点击，证明按钮确实接上了。
+lua.execute(r"""
+win = dispatcher_proxy                      -- 完整版窗口未创建，用同一个代理当 win
+ADDED_WINDOW_IDS = {}
+local old_add = disp.AddWindow
+disp.AddWindow = function(self, props, content)
+    ADDED_WINDOW_IDS[#ADDED_WINDOW_IDS + 1] = tostring(props and props.ID or "?")
+    return old_add(self, props, content)
+end
+BIND_ERR = nil
+local ok, err = pcall(bind_full_window_events)
+if not ok then BIND_ERR = tostring(err) end
+""")
+check("bind_full_window_events 可执行（完整版事件绑定不炸）", g.BIND_ERR is None, str(g.BIND_ERR or "")[:200])
+
+log_type = str(lua.execute("return type(win.On.LogWindowBtn.Clicked)"))
+check("运行日志按钮已绑定为函数", log_type == "function", log_type)
+if log_type == "function":
+    lua.execute("local ok, err = pcall(function() win.On.LogWindowBtn.Clicked({ID='LogWindowBtn'}) end); CLICK_ERR = err")
+    check("点击运行日志不报错", g.CLICK_ERR is None, str(g.CLICK_ERR or "")[:200])
+added = [str(x) for x in g.ADDED_WINDOW_IDS.values()] if g.ADDED_WINDOW_IDS else []
+check("点击后真的创建运行日志窗口", "WorkflowLogWindow" in added, str(added))
+
+redo_type = str(lua.execute("return type(win.On.RedoBtn.Clicked)"))
+check("重做按钮已绑定为函数", redo_type == "function", redo_type)
+if redo_type == "function":
+    lua.execute("local ok, err = pcall(function() win.On.RedoBtn.Clicked({ID='RedoBtn'}) end); REDO_ERR = err")
+    check("空栈点重做不报错（走「没有可重做的操作」）", g.REDO_ERR is None, str(g.REDO_ERR or "")[:200])
+check("重做后 redo_stack 仍为空", int(lua.execute("return #redo_stack")) == 0,
+      str(lua.execute("return #redo_stack")))
+check("撤回/重做按钮状态函数仍在", bool(lua.execute("return type(update_undo_redo_button_states) == 'function'")))
 
 print()
 if failures:

@@ -12,10 +12,11 @@ token，再按归一化字符序列（中日韩逐字、拉丁按词组）映射
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, Callable
 
 # 音频时长上限：对齐器单次前向的 timestamp 槽位有限，超长音频会被压缩
 DIRECT_MAX_AUDIO_SECONDS = 300.0
@@ -260,8 +261,9 @@ def _stabilize_blocks(blocks: list[SubtitleBlock]) -> list[SubtitleBlock]:
         if lower >= upper:
             continue
         boundary = min(max((previous.end + current.start) / 2.0, lower), upper)
-        previous.end = boundary
-        current.start = boundary
+        # SubtitleBlock 是 frozen dataclass，只能整块替换；原地赋值会抛 FrozenInstanceError
+        output[index - 1] = SubtitleBlock(previous.start, boundary, previous.text)
+        output[index] = SubtitleBlock(boundary, current.end, current.text)
     return output
 
 
@@ -413,24 +415,136 @@ def evaluate_direct_quality(
     )
 
 
+HARD_BREAK_CHARS = "。！？!?；;…"
+SOFT_BREAK_CHARS = "，,、：: \t）)】」》"
+
+
+def default_text_length(text: str) -> int:
+    """与主断句路径同一把尺：数字符、忽略空白。"""
+    return len(re.sub(r"\s+", "", str(text or "")))
+
+
+def _break_after(text: str, breaks: str, start: int, upper: int) -> int:
+    for position in range(upper, start, -1):
+        if text[position - 1] in breaks:
+            return position
+    return -1
+
+
+def _inside_latin_word(text: str, position: int) -> bool:
+    if position <= 0 or position >= len(text):
+        return False
+    previous, current = text[position - 1], text[position]
+    return previous.isascii() and current.isascii() and previous.isalnum() and current.isalnum()
+
+
+def _latin_word_start(text: str, start: int, position: int) -> int:
+    cursor = position
+    while cursor > start and text[cursor - 1].isascii() and text[cursor - 1].isalnum():
+        cursor -= 1
+    return cursor
+
+
+def split_text_to_max_chars(
+    text: str,
+    max_chars: int | None,
+    measure: Callable[[str], int] = default_text_length,
+) -> list[str]:
+    """超长文本按标点切细；片段首尾相接，拼回原文一字不差。
+
+    优先切在句末标点后，其次读断类标点/括号/空白，都没有才不切断英文单词。
+    单个英文词本身超限就整词放行（与主路径 enforce_hard_char_limit 同一取舍）。
+    """
+    value = str(text or "")
+    if not value:
+        return [value]
+    if not max_chars or int(max_chars) <= 0 or measure(value) <= max_chars:
+        return [value]
+
+    limit = int(max_chars)
+    length = len(value)
+    segments: list[str] = []
+    start = 0
+    while start < length:
+        end = start
+        while end < length and measure(value[start:end + 1]) <= limit:
+            end += 1
+        if end >= length:
+            cut = length
+        else:
+            cut = _break_after(value, HARD_BREAK_CHARS, start, end)
+            if cut <= start:
+                cut = _break_after(value, SOFT_BREAK_CHARS, start, end)
+            if cut <= start:
+                cut = end
+            if _inside_latin_word(value, cut):
+                backed = _latin_word_start(value, start, cut)
+                if backed > start and measure(value[start:backed]) <= limit:
+                    cut = backed
+                elif backed <= start:
+                    # 整个窗口都在一个英文词里：整词放行，宁可超上限也不把词劈开
+                    word_end = cut
+                    while word_end < length and value[word_end].isascii() and value[word_end].isalnum():
+                        word_end += 1
+                    if word_end > start:
+                        cut = word_end
+        if cut <= start:
+            cut = start + 1
+        segments.append(value[start:cut])
+        start = cut
+    return segments
+
+
 def build_direct_rows(
     mapping: ScriptMapping,
     *,
     fps: float,
+    timeline_start_frame: int = 0,
     speaker_track_index: int = 1,
+    max_chars: int | None = None,
+    text_length: Callable[[str], int] | None = None,
 ) -> list[dict]:
-    """映射块 → v5 管线行格式（秒转帧；文本即文稿原文，零改动）。"""
+    """映射块 → v5 管线行格式（文本即文稿原文，零改动）。
+
+    block.start/end 是相对**已截出的选区音频**的秒数，回填要落到时间线绝对帧，
+    所以必须加 timeline_start_frame；漏了加偏移的行会全部落在选区之前，
+    被核心层的 scope 裁剪成 end<=start 而整批丢弃。
+
+    ``max_chars`` 对应用户选的「字幕长度（标准 ≤25 / 短视频 ≤10）」。文稿一行可能
+    就是一整段（200 字），不拆就会出一条 200 字的字幕——直接无视用户设置。
+    拆分只改切点不改文字：各片按标点取整，帧号按字符数比例分配且首尾相接。
+    """
+    measure = text_length or default_text_length
     rows: list[dict] = []
+    base_frame = int(timeline_start_frame or 0)
+    rate = max(1.0, float(fps or 30.0))
+    index = 1
     for block in mapping.blocks:
-        start_frame = int(round(block.start * fps))
-        end_frame = max(start_frame + 1, int(round(block.end * fps)))
-        rows.append(
-            {
-                "text": block.text,
-                "start_frame": start_frame,
-                "end_frame": end_frame,
-                "speaker_track_index": speaker_track_index,
-                "timing_decision": "script_direct",
-            }
-        )
+        block_start = base_frame + int(round(block.start * rate))
+        block_end = max(block_start + 1, base_frame + int(round(block.end * rate)))
+        segments = split_text_to_max_chars(block.text, max_chars, measure)
+        weights = [max(1, measure(segment)) for segment in segments]
+        total_weight = sum(weights)
+        cursor = 0
+        for position, segment in enumerate(segments):
+            span = block_end - block_start
+            start_frame = block_start if position == 0 else block_start + int(span * cursor / total_weight)
+            cursor += weights[position]
+            end_frame = (
+                block_end
+                if position == len(segments) - 1
+                else block_start + int(span * cursor / total_weight)
+            )
+            end_frame = max(end_frame, start_frame + 1)
+            rows.append(
+                {
+                    "index": index,
+                    "text": segment,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "speaker_track_index": speaker_track_index,
+                    "timing_decision": "script_direct",
+                }
+            )
+            index += 1
     return rows

@@ -7,6 +7,7 @@ Windows 屏蔽、ffmpeg 解析第一行选择。
 运行：python tests/qa_python_entries.py
 """
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,8 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ZIP = ROOT / "dist" / "SubFix-v3.4.0-Windows.zip"
+from qa_dist import resolve_zip  # 版本写死会让 QA 解压旧包（曾长期测 3.4.0）
+ZIP = resolve_zip()
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 failures = []
@@ -34,6 +36,26 @@ def run(cmd, **kw):
     return r.returncode, out
 
 
+def run_isolated(cmd):
+    """需要「干净机器」语义的检查专用：把 home 与 SUBFIX_QWEN3_* 全指向空临时目录。
+
+    本机 %APPDATA%\\SubFix 一旦建过 junction（装过模型），status 直接报 installed，
+    原来那句「空环境返回 state=missing」会在装过模型的机器上必然失败——
+    它测的是本机状态而不是代码，隔离后才与安装与否无关。
+    """
+    home = Path(tempfile.mkdtemp(prefix="subfix_qa_home_"))
+    env = dict(os.environ)
+    env.update({
+        "USERPROFILE": str(home),
+        "APPDATA": str(home / "AppData" / "Roaming"),
+        "LOCALAPPDATA": str(home / "AppData" / "Local"),
+        "SUBFIX_QWEN3_ASR_MODEL": "",
+        "SUBFIX_QWEN3_ALIGNER_MODEL": "",
+    })
+    r = subprocess.run(cmd, capture_output=True, cwd=str(ROOT), env=env)
+    return r.returncode, (r.stdout + r.stderr).decode("utf-8", "replace")
+
+
 # ---------- 0. 安装布局准备（从 zip 解压） ----------
 stage = Path(tempfile.mkdtemp(prefix="subfix_qa_py_"))
 with zipfile.ZipFile(ZIP) as zf:
@@ -47,8 +69,8 @@ for script in ("subfix_asr_transcribe.py", "subfix_generate_v4.py",
     rc, out = run([sys.executable, str(support / script), "--help"])
     check(f"导入链完整: {script}", rc == 0 and "Traceback" not in out, out[:200])
 
-# ---------- 2. qwen 管理器：status（Windows 布局） ----------
-rc, out = run([sys.executable, "-B", str(support / "subfix_qwen_local_manager.py"),
+# ---------- 2. qwen 管理器：status（Windows 布局，干净机器语义） ----------
+rc, out = run_isolated([sys.executable, "-B", str(support / "subfix_qwen_local_manager.py"),
                "--action", "status", "--root", str(stage), "--output", str(stage / "status.json")])
 check("qwen 管理器: status 正常退出", rc == 0, out[:300])
 status_file = stage / "status.json"

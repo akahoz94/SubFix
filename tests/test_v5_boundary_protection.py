@@ -112,7 +112,7 @@ def test_pipeline_extends_display_only_after_refinement_and_keeps_long_pauses(tm
         events.append("extend")
         return v5.v4.extend_subtitle_row_tails(*args)
 
-    source = (ROOT / "subfix_asr_transcribe.py").read_text()
+    source = (ROOT / "subfix_asr_transcribe.py").read_text(encoding="utf-8")
     start = source.index("        subtitle_rows, hard_char_split_count = generate_v4.enforce_hard_char_limit(")
     end = source.index('        diagnostic["hotword_replacement_count"] +=', start)
     rows = [{"text": "前句", "start_frame": 15, "end_frame": 30, "speaker_track_index": 1},

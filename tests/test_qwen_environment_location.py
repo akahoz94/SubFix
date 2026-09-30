@@ -39,7 +39,7 @@ class EnvironmentLocationTests(unittest.TestCase):
         self.assertFalse(self.paths.env_dir.is_relative_to(self.paths.root))
 
     def test_lua_manager_launches_suppress_runtime_bytecode_writes(self):
-        source = (ROOT / ".subfix_support/subfix_generate_selection_core.lua").read_text()
+        source = (ROOT / ".subfix_support/subfix_generate_selection_core.lua").read_text(encoding="utf-8")
         for name in ["build_qwen_status_command", "build_qwen_install_command"]:
             body = source.split("local function " + name, 1)[1].split("\nend", 1)[0]
             # Windows 移植后统一用解释器 -B 标志抑制字节码写入（与 PYTHONDONTWRITEBYTECODE=1 等价）
