@@ -197,3 +197,48 @@ def test_build_direct_rows_without_cap_is_unchanged():
     mapping = sd.map_aligned_tokens_to_lines(tokens, lines, language="Chinese")
     rows = sd.build_direct_rows(mapping, fps=30.0)
     assert [row["text"] for row in rows] == [line.text for line in lines]
+
+
+def test_parse_reference_lines_auto_splits_paragraph():
+    """粘贴进来的经常是一整段：不分句就是一条字幕=一整段。"""
+    paragraph = "第一句话讲完了。第二句话也讲完了！第三句用问号？后面还有没句末标点的尾巴一直拖下去"
+    lines = sd.parse_reference_lines(paragraph)
+    assert len(lines) >= 4
+    assert "".join(line.text for line in lines) == paragraph
+    assert all(sd.default_text_length(line.text) <= sd.DIRECT_MAX_SENTENCE_CHARS + 12 for line in lines)
+
+
+def test_parse_reference_lines_keeps_newline_scripts_unchanged():
+    lines = sd.parse_reference_lines(SCRIPT)
+    assert [line.text for line in lines] == SCRIPT.splitlines()
+    assert [line.index for line in lines] == list(range(len(lines)))
+
+
+def test_prune_drops_tokens_pushed_beyond_the_audio():
+    tokens = [
+        {"text": "念到的", "start": 0.2, "end": 1.2},
+        {"text": "没念的", "start": 6.9, "end": 8.0},   # 选区只有 6.96s，尾部是被硬塞的
+    ]
+    kept = sd.prune_out_of_bounds_tokens(tokens, 6.96)
+    assert [t["text"] for t in kept] == ["念到的"]
+
+
+def test_window_picks_spoken_sentences_and_drops_implausible_ones():
+    """整篇稿里只念了中间一句：头尾被挤成极窄区间，必须按语速筛掉。"""
+    whole = "开场白欢迎语从来没被念出来过。真正念到的这一句话在这里。\n结尾告别语同样没有被念到哦。"
+    lines = sd.parse_reference_lines(whole)
+    spoken = [line for line in lines if "真正念到" in line.text][0]
+    # 对齐器按文稿顺序出 token；没念的句子被挤到相邻说话的边界上，宽度接近 0
+    tokens = [
+        {"text": "开场白欢迎语从来没被念出来过。", "start": 0.0, "end": 0.05},
+        {"text": spoken.text, "start": 0.1, "end": 3.1},
+        {"text": "结尾告别语同样没有被念到哦。", "start": 3.15, "end": 3.16},
+    ]
+    mapping, used, note = sd.align_script_to_spoken_window(
+        tokens, lines, language="Chinese", duration=3.2
+    )
+    assert note != ""
+    assert [line.text for line in used] == [spoken.text]
+    rows = sd.build_direct_rows(mapping, fps=25.0, timeline_start_frame=268)
+    assert [r["text"] for r in rows] == [spoken.text]
+    assert rows[0]["start_frame"] >= 268

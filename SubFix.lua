@@ -351,7 +351,7 @@ function subfix_launch_bg_batch(batch_file, pid_file)
     subfix_execute_hidden('start "SubFixBG" /b cmd /c "' .. subfix_cmd_path(batch_file) .. '"')
 end
 
-SUBFIX_VERSION = "3.7.1"
+SUBFIX_VERSION = "3.7.2"
 
 -- 墙上时钟毫秒。不能用 os.clock：那是 CPU 时间，UI 阻塞（正是我们要测的等待）根本不计入，
 -- 之前日志里「mini_win:Show() 用时: 0 ms」就是这么来的。

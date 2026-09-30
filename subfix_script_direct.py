@@ -20,6 +20,11 @@ from typing import Any, Callable
 
 # 音频时长上限：对齐器单次前向的 timestamp 槽位有限，超长音频会被压缩
 DIRECT_MAX_AUDIO_SECONDS = 300.0
+# 中文口播一般 4-6 字/秒，超过这个比例说明音频比稿子短得多
+DIRECT_MAX_PLAUSIBLE_CHARS_PER_SECOND = 9.0
+# 粘贴的整段文稿常常一行的到底；超过这个长度就按标点自动分句
+DIRECT_AUTO_SPLIT_CHARS = 24
+DIRECT_SENTENCE_HARD_BREAK_CHARS = 40
 DIRECT_MIN_ALIGNMENT_COVERAGE = 0.98
 DIRECT_MIN_MAPPING_COVERAGE = 0.98
 DIRECT_MIN_LINE_COVERAGE = 0.90
@@ -41,6 +46,7 @@ class SubtitleBlock:
     start: float
     end: float
     text: str
+    line_index: int = -1
 
 
 @dataclass
@@ -71,22 +77,142 @@ class DirectQuality:
     locally_collapsed_line_indices: tuple[int, ...]
 
 
+STRONG_SENTENCE_ENDS = "。！？!?…"
+WEAK_BREAKS = "，,、；;：:"
+DIRECT_MAX_SENTENCE_CHARS = 40
+
+
+def split_line_into_sentences(raw_line: str) -> list[str]:
+    """粘贴进来的经常是一整段没有换行的稿：先按句末标点自动分句。
+
+    一行 = 一条候选字幕，所以不分句就会出现「一条字幕 = 一整段」，
+    既过不了对齐，也谈不上长度上限。
+    """
+    text = str(raw_line or "").strip()
+    if not text:
+        return []
+    sentences: list[str] = []
+    buffer = ""
+    for character in text:
+        buffer += character
+        if character in STRONG_SENTENCE_ENDS:
+            sentences.append(buffer.strip())
+            buffer = ""
+    if buffer.strip():
+        sentences.append(buffer.strip())
+
+    output: list[str] = []
+    for sentence in sentences:
+        if default_text_length(sentence) <= DIRECT_MAX_SENTENCE_CHARS:
+            output.append(sentence)
+            continue
+        # 仍然过长（整段没有句末标点）时，退到读断类标点切
+        piece = ""
+        for character in sentence:
+            piece += character
+            if character in WEAK_BREAKS and default_text_length(piece) >= DIRECT_MAX_SENTENCE_CHARS // 2:
+                output.append(piece.strip())
+                piece = ""
+        if piece.strip():
+            if output and default_text_length(output[-1]) + default_text_length(piece) <= DIRECT_MAX_SENTENCE_CHARS:
+                output[-1] = output[-1] + piece
+            else:
+                output.append(piece.strip())
+    return [item for item in output if item]
+
+
 def parse_reference_lines(reference_text: str) -> list[ScriptLine]:
-    """非空行 = 一条候选字幕；全空抛错（调用方应先判空）。"""
+    """非空句 = 一条候选字幕（整段粘贴会先自动分句）；全空抛错。"""
     lines: list[ScriptLine] = []
     for raw_line in str(reference_text or "").splitlines():
-        if not raw_line.strip():
-            continue
-        lines.append(
-            ScriptLine(
-                index=len(lines),
-                text=raw_line,
-                normalized_text=normalize_alignment_text(raw_line),
+        for sentence in split_line_into_sentences(raw_line):
+            lines.append(
+                ScriptLine(
+                    index=len(lines),
+                    text=sentence,
+                    normalized_text=normalize_alignment_text(sentence),
+                )
             )
-        )
     if not lines:
         raise ValueError("SCRIPT_MATCH_REFERENCE_EMPTY")
     return lines
+
+
+def prune_out_of_bounds_tokens(tokens: list[dict], duration: float, tolerance: float = 0.05) -> list[dict]:
+    """丢掉超出音频长度的 token。
+
+    贴整篇稿而选区只念了其中几句时，对齐器会把没念的句子挤到音频末尾变成
+    越界时间戳 —— 它们正是 SCRIPT_INTERVAL_OUT_OF_BOUNDS 的来源，
+    留着还会拉低唯一区间占比（COLLAPSED_ALIGNMENT_INTERVALS）。
+    """
+    kept: list[dict] = []
+    for token in tokens:
+        start = float(token.get("start") or 0.0)
+        end = float(token.get("end") or 0.0)
+        if start < -tolerance or end > duration + tolerance:
+            continue
+        kept.append(token)
+    return kept
+
+
+def _longest_contiguous_run(indices: list[int]) -> list[int]:
+    best: list[int] = []
+    current: list[int] = []
+    for value in indices:
+        if current and value != current[-1] + 1:
+            current = []
+        current.append(value)
+        if len(current) > len(best):
+            best = list(current)
+    return best
+
+
+def _block_chars_per_second(block: SubtitleBlock) -> float:
+    seconds = block.end - block.start
+    if seconds <= 1e-6:
+        return float("inf")
+    return default_text_length(block.text) / seconds
+
+
+def align_script_to_spoken_window(
+    tokens: list[dict],
+    lines: list[ScriptLine],
+    *,
+    language: str,
+    duration: float,
+) -> tuple[ScriptMapping, list[ScriptLine], str]:
+    """全篇映射；只对上一部分句子时，取出真正念到的连续句段重新映射。
+
+    返回 (映射, 参与映射的文稿行, 说明)。贴整篇稿配短选区是正常用法，不能因为
+    "有句子没念"就整段放弃直出。没念到的句子会被对齐器硬塞成极窄区间（实测 13 字
+    挤进 0.56 秒 = 23 字/秒），所以除了"有没有映射上"还要按语速再筛一遍。
+    """
+    full = map_aligned_tokens_to_lines(tokens, lines, language=language)
+    if not full.blocks:
+        return full, lines, ""
+
+    limit = DIRECT_MAX_PLAUSIBLE_CHARS_PER_SECOND
+    unmapped = set(full.unmapped_line_indices)
+    implausible = {block.line_index for block in full.blocks if _block_chars_per_second(block) > limit}
+    usable = [index for index in range(len(lines)) if index not in unmapped and index not in implausible]
+    if len(usable) == len(lines):
+        return full, lines, ""
+    run = _longest_contiguous_run(usable)
+    if not run:
+        return full, lines, ""
+
+    window_lines = parse_reference_lines("\n".join(lines[index].text for index in run))
+    window = map_aligned_tokens_to_lines(tokens, window_lines, language=language)
+    kept_blocks = [block for block in window.blocks if _block_chars_per_second(block) <= limit]
+    if not kept_blocks:
+        return full, lines, ""
+    kept_indices = {block.line_index for block in kept_blocks}
+    window.blocks = kept_blocks
+    survived = [line for line in window_lines if line.index in kept_indices]
+    note = "文稿 %d 句中取第 %d-%d 句（其余 %d 句不在本选区音频里）" % (
+        len(lines), run[0] + 1, run[-1] + 1, len(lines) - len(run)
+    )
+    return window, survived, note
 
 
 def normalize_alignment_text(value: str) -> str:
@@ -250,7 +376,7 @@ def _matching_pairs(expected: str, actual: str) -> list[tuple[int, int]]:
 
 
 def _stabilize_blocks(blocks: list[SubtitleBlock]) -> list[SubtitleBlock]:
-    output = [SubtitleBlock(block.start, block.end, block.text) for block in blocks]
+    output = [SubtitleBlock(block.start, block.end, block.text, block.line_index) for block in blocks]
     for index in range(1, len(output)):
         previous = output[index - 1]
         current = output[index]
@@ -262,8 +388,8 @@ def _stabilize_blocks(blocks: list[SubtitleBlock]) -> list[SubtitleBlock]:
             continue
         boundary = min(max((previous.end + current.start) / 2.0, lower), upper)
         # SubtitleBlock 是 frozen dataclass，只能整块替换；原地赋值会抛 FrozenInstanceError
-        output[index - 1] = SubtitleBlock(previous.start, boundary, previous.text)
-        output[index] = SubtitleBlock(boundary, current.end, current.text)
+        output[index - 1] = SubtitleBlock(previous.start, boundary, previous.text, previous.line_index)
+        output[index] = SubtitleBlock(boundary, current.end, current.text, current.line_index)
     return output
 
 
@@ -309,7 +435,7 @@ def map_aligned_tokens_to_lines(
         if end <= start:
             unmapped.append(line.index)
             continue
-        blocks.append(SubtitleBlock(start, end, line.text))
+        blocks.append(SubtitleBlock(start, end, line.text, line_index=line.index))
 
     return ScriptMapping(
         blocks=_stabilize_blocks(blocks),

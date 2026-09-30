@@ -5650,6 +5650,30 @@ def select_adaptive_subtitle_candidates(
     }
 
 
+# 质量门原因是机器可读代码；回退时必须翻成人话显示给用户，
+# 否则用户只看到"怎么这么慢"，看不到"直出为什么没用上"。
+DIRECT_REASON_LABELS = {
+    "MULTIPLE_BATCHES_UNSUPPORTED": "选区跨了多条素材",
+    "NO_SCRIPT": "没有收到文稿",
+    "SCRIPT_EMPTY": "文稿是空的",
+    "AUDIO_FILE_MISSING": "找不到选区音频文件",
+    "AUDIO_DURATION_UNKNOWN": "选区音频时长读不出来",
+    "AUDIO_TOO_LONG_FOR_DIRECT_ALIGNMENT": "选区超过 5 分钟，直出不支持",
+    "SCRIPT_TOO_LONG_FOR_SELECTION": "文稿比选区里实际说的话长（贴的是整篇稿，选区只覆盖其中一段）",
+    "COLLAPSED_ALIGNMENT_INTERVALS": "整段文稿被压进很短的音频（没照稿念，或选区太短）",
+    "SCRIPT_INTERVAL_OUT_OF_BOUNDS": "文稿内容与选区里的话不是同一段",
+    "UNMAPPED_SCRIPT_LINES": "有句子在音频里没被念到",
+    "LOW_ALIGNMENT_COVERAGE": "文稿字符与音频对不上",
+    "LOW_SCRIPT_MAPPING_COVERAGE": "文稿句子覆盖不足",
+    "ALIGNMENT_EMPTY": "对齐器没有给出任何时间戳",
+    "LOCALLY_COLLAPSED_SCRIPT_INTERVALS": "个别句子被压成一瞬（语速与文稿不符）",
+}
+
+
+def describe_direct_reasons(reasons: list[str]) -> str:
+    return "；".join(DIRECT_REASON_LABELS.get(str(code), str(code)) for code in reasons if str(code))
+
+
 def try_script_direct_subtitles(
     batches: list[dict[str, Any]],
     args: argparse.Namespace,
@@ -5741,11 +5765,24 @@ def try_script_direct_subtitles(
             {"text": str(item.text), "start": float(item.start_time), "end": float(item.end_time)}
             for item in getattr(alignment, "items", []) or []
         ]
-        mapping = script_direct.map_aligned_tokens_to_lines(
-            tokens, lines, language=qwen3_language_name(getattr(args, "language", None)) or "Chinese",
+        language_name = qwen3_language_name(getattr(args, "language", None)) or "Chinese"
+        # 贴整篇稿配短选区：先扔掉被挤到音频之外的 token，再从剩下的里面定位真正念到的连续句段
+        spoken_tokens = script_direct.prune_out_of_bounds_tokens(tokens, duration)
+        if not spoken_tokens:
+            reasons.append("ALIGNMENT_EMPTY")
+            return None
+        mapping, used_lines, window_note = script_direct.align_script_to_spoken_window(
+            spoken_tokens, lines, language=language_name, duration=duration
         )
+        if window_note:
+            print(f"[SubFix Direct] {window_note}")
+            args._direct_window_note = window_note
+            write_progress(
+                progress_path, "script_direct", f"文稿定位｜{window_note}",
+                batch_index=0, total_batches=1, progress_index=45, progress_total=100,
+            )
         quality = script_direct.evaluate_direct_quality(
-            tokens, mapping, line_count=len(lines), duration=duration,
+            spoken_tokens, mapping, line_count=len(used_lines), duration=duration,
         )
         if not quality.passed:
             reasons.extend(quality.reasons)
@@ -5788,6 +5825,8 @@ def try_script_direct_subtitles(
             "script_direct": {
                 "path": "direct",
                 "line_count": len(lines),
+                "mapped_line_count": len(used_lines),
+                "window_note": str(getattr(args, "_direct_window_note", "") or ""),
                 "row_count": len(rows),
                 "max_chars": getattr(args, "max_chars", None),
                 "unique_interval_ratio": round(quality.unique_interval_ratio, 4),
@@ -5835,14 +5874,26 @@ def run_generate_subtitles_batch_plan_v4(
     if direct_mode not in {"auto", "proofread", "direct"}:
         direct_mode = "auto"
     script_file_path_value = getattr(args, "script_file", None)
+    direct_fallback_note: dict[str, Any] | None = None
     if script_file_path_value and direct_mode in {"auto", "direct"}:
         direct_outcome = try_script_direct_subtitles(batches, args, progress_path)
         if direct_outcome is not None:
             return direct_outcome
+        direct_reasons = list(getattr(args, "_direct_fail_reasons", []))
+        direct_fallback_note = {
+            "path": "fallback",
+            "reasons": direct_reasons,
+            "detail": str(getattr(args, "_direct_fail_detail", "") or ""),
+        }
         if direct_mode == "direct":
             raise RuntimeError(
-                "照稿直出未通过质量门：" + "；".join(getattr(args, "_direct_fail_reasons", []))
+                "照稿直出未通过质量门：" + describe_direct_reasons(direct_reasons)
+                + (f"（{direct_fallback_note['detail']}）" if direct_fallback_note["detail"] else "")
             )
+        # 自动模式回退是静默的：进度窗里必须说清楚为什么没走直出，否则只剩"莫名变慢"
+        message = "文稿直出未通过：" + describe_direct_reasons(direct_reasons) + "｜改走转录 + 文稿校对"
+        print(f"[SubFix Direct] {message}")
+        write_progress(progress_path, "script_direct_skipped", message, indeterminate=True)
     subtitle_mode = str(getattr(args, "subtitle_mode", "narration") or "narration")
     if subtitle_mode not in {"narration", "live"}:
         subtitle_mode = "narration"
