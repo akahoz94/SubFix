@@ -5660,6 +5660,7 @@ DIRECT_REASON_LABELS = {
     "AUDIO_DURATION_UNKNOWN": "选区音频时长读不出来",
     "AUDIO_TOO_LONG_FOR_DIRECT_ALIGNMENT": "选区超过 5 分钟，直出不支持",
     "SCRIPT_TOO_LONG_FOR_SELECTION": "文稿比选区里实际说的话长（贴的是整篇稿，选区只覆盖其中一段）",
+    "SCRIPT_MUCH_LONGER_THAN_SELECTION": "文稿远远长于本选区（整篇一次对不齐），改用转录 + 文稿校对，不浪费十几秒",
     "COLLAPSED_ALIGNMENT_INTERVALS": "整段文稿被压进很短的音频（没照稿念，或选区太短）",
     "SCRIPT_INTERVAL_OUT_OF_BOUNDS": "文稿内容与选区里的话不是同一段",
     "UNMAPPED_SCRIPT_LINES": "有句子在音频里没被念到",
@@ -5704,6 +5705,24 @@ def try_script_direct_subtitles(
     except ValueError:
         reasons.append("SCRIPT_EMPTY")
         return None
+
+    # 整篇稿远远长于选区时，一次对齐定位不出来（实测 440 字 / 6.96 秒：token 全部被挤到
+    # 音频外，直出必挂）。这种情况省掉十几秒的白跑，直接走「转录 + 文稿校对」——
+    # 校对只需要转录文本对得上文稿的哪一段，不需要整篇的时间戳。
+    source_start_value = batch.get("source_start")
+    source_end_value = batch.get("source_end")
+    if source_start_value is not None and source_end_value is not None:
+        selection_seconds = max(0.0, float(source_end_value) - float(source_start_value))
+        if selection_seconds > 0.5:
+            script_chars = sum(len("".join(str(line.text).split())) for line in lines)
+            chars_per_second = script_chars / selection_seconds
+            if chars_per_second > script_direct.DIRECT_MAX_ALIGNABLE_CHARS_PER_SECOND:
+                reasons.append("SCRIPT_MUCH_LONGER_THAN_SELECTION")
+                args._direct_fail_detail = (
+                    f"文稿 {script_chars} 字 / 选区 {selection_seconds:.1f} 秒 ≈ "
+                    f"{chars_per_second:.0f} 字每秒，整篇一次对不齐"
+                )
+                return None
 
     audio_path = Path(str(batch.get("audio") or ""))
     if not audio_path.is_file():
@@ -7613,6 +7632,35 @@ def _serve_request(argv: list[str], host: str, port: int, connect_timeout: float
     return True
 
 
+def _spawn_serve_process() -> bool:
+    """拉起一个 detached 常驻服务（不等待就绪）。
+
+    已有就绪文件时绝不重复拉起：实测双进程抢显存会全员掉进 sysmem fallback，
+    30 秒请求拖到 21 分钟。
+    """
+    import glob
+    import subprocess
+
+    if sorted(glob.glob(str(_serve_ready_dir() / SUBFIX_SERVE_READY_GLOB))):
+        return False
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--mode", "serve",
+             "--serve-idle-timeout", str(int(os.getenv("SUBFIX_SERVE_IDLE_TIMEOUT") or "900"))],
+            **popen_kwargs,
+        )
+    except OSError:
+        return False
+    return True
+
+
 def try_serve_relay(argv: list[str]) -> bool:
     """把本次调用转发给常驻 serve；不可用则拉起一个。
 
@@ -7639,23 +7687,7 @@ def try_serve_relay(argv: list[str]) -> bool:
             time.sleep(2.0)
         return False
 
-    import subprocess
-
-    popen_kwargs: dict[str, Any] = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "stdin": subprocess.DEVNULL,
-    }
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | NEW_PROCESS_GROUP
-    try:
-        subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "--mode", "serve",
-             "--serve-idle-timeout", str(int(os.getenv("SUBFIX_SERVE_IDLE_TIMEOUT") or "900"))],
-            **popen_kwargs,
-        )
-    except OSError:
-        return False
+    _spawn_serve_process()
     deadline = time.monotonic() + float(os.getenv("SUBFIX_SERVE_SPAWN_TIMEOUT") or "240")  # 覆盖冷启动 import torch + 双模型加载
     while time.monotonic() < deadline:
         time.sleep(1.0)
@@ -7810,6 +7842,7 @@ def main(argv: list[str] | None = None) -> int:
             "learn_segmentation_profile",
             "onsets",
             "serve",
+            "prewarm",
         ),
         default="transcribe",
     )
@@ -7843,8 +7876,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.mode != "serve" and not args.output:
-        parser.error("--output is required unless --mode serve")
+    if args.mode not in {"serve", "prewarm"} and not args.output:
+        parser.error("--output is required unless --mode serve/prewarm")
     output_path = Path(args.output or Path(tempfile.gettempdir()) / "subfix_serve_unused.json")
     progress_path = Path(args.progress_json) if args.progress_json else None
     try:
@@ -7861,6 +7894,11 @@ def main(argv: list[str] | None = None) -> int:
                 port=int(os.getenv("SUBFIX_SERVE_PORT") or "53177"),
                 idle_timeout=float(getattr(args, "serve_idle_timeout", 900.0) or 900.0),
             )
+        if args.mode == "prewarm":
+            # 只负责把常驻服务拉起来就退出：模型冷加载要 1-2 分钟，
+            # 让用户贴稿的那段时间去焐热模型，而不是点完确定干等
+            _spawn_serve_process()
+            return 0
         if args.mode == "learn_segmentation_profile":
             if not args.calibration_json:
                 raise RuntimeError("缺少 --calibration-json")

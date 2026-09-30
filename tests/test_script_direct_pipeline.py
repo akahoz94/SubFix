@@ -9,6 +9,7 @@
 """
 import importlib.util
 import sys
+import time
 import types
 import wave
 from pathlib import Path
@@ -166,3 +167,25 @@ def _run_direct_payload(tmp_path, monkeypatch, max_chars):
         assert len(rows) == 3
         assert rows[0]["start_frame"] == BASE + 30, rows[0]
     return payload, rows
+
+
+def test_script_far_longer_than_selection_skips_alignment(tmp_path, monkeypatch):
+    """整篇稿 ≫ 选区时不许白跑一次对齐（实测那次 13.9 秒后必挂，直接走转录+校对）。"""
+    asr = load_asr_module()
+    monkeypatch.setattr(asr, "load_qwen3_forced_aligner",
+                        lambda: (_ for _ in ()).throw(AssertionError("不该加载对齐器")))
+    script = tmp_path / "script.txt"
+    script.write_text(" filler。" * 400, encoding="utf-8")   # ~2400 字
+    batch = {
+        "audio": str(tmp_path / "missing.wav"), "fps": 25.0,
+        "source_start": 12.08, "source_end": 19.04,
+        "timeline_start_frame": 268, "track_index": 1, "batch_id": "b1",
+    }
+    args = types.SimpleNamespace(script_file=str(script), script_direct_mode="auto",
+                                 language="zh-CN", ffmpeg=None, generate_engine="v5", max_chars=25)
+    t0 = time.monotonic()
+    out = asr.try_script_direct_subtitles([batch], args, None)
+    elapsed = time.monotonic() - t0
+    assert out is None
+    assert args._direct_fail_reasons == ["SCRIPT_MUCH_LONGER_THAN_SELECTION"]
+    assert elapsed < 1.0, f"应该秒退，实际 {elapsed:.1f}s"

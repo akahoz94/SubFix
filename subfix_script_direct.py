@@ -22,6 +22,10 @@ from typing import Any, Callable
 DIRECT_MAX_AUDIO_SECONDS = 300.0
 # 中文口播一般 4-6 字/秒，超过这个比例说明音频比稿子短得多
 DIRECT_MAX_PLAUSIBLE_CHARS_PER_SECOND = 9.0
+# 整篇稿比选区能装的字数多出这个倍数时，一次对齐根本定位不出来
+# （实测 440 字对 6.96 秒音频：所有 token 被挤到越界，直出必然失败），
+# 别浪费十几秒去试，直接走转录 + 文稿校对。
+DIRECT_MAX_ALIGNABLE_CHARS_PER_SECOND = 20.0
 # 粘贴的整段文稿常常一行的到底；超过这个长度就按标点自动分句
 DIRECT_AUTO_SPLIT_CHARS = 24
 DIRECT_SENTENCE_HARD_BREAK_CHARS = 40

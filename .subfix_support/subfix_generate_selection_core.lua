@@ -4685,6 +4685,28 @@ local function generate_selection_subtitles()
     return true
 end
 
+-- 识别模型冷加载要 1-2 分钟。用户贴稿的那段时间是免费的，用来把服务拉起来，
+-- 点「确定」时才不用干等。已有就绪文件时 _spawn_serve_process 自己会跳过，不会双进程抢显存。
+function SubFixGenerateSelectionCore.prewarm_asr_service()
+    local ok, result = pcall(function()
+        local paths = resolve_asr_paths()
+        if not paths or not paths.python or not paths.helper then return false end
+        if not file_exists(paths.python) or not file_exists(paths.helper) then return false end
+        local uid = tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
+        local batch_file = temp_dir() .. "/SubFix_ASR_Prewarm_" .. uid .. ".cmd"
+        local stdout_file = temp_dir() .. "/SubFix_ASR_Prewarm_" .. uid .. ".out"
+        local cmd_line = table.concat({
+            shell_quote(paths.python), "-B", shell_quote(paths.helper), "--mode", "prewarm"
+        }, " ")
+        if not subfix_write_bg_batch(batch_file, cmd_line, { stdout_file = stdout_file }) then
+            return false
+        end
+        subfix_launch_bg_batch(batch_file)
+        return true
+    end)
+    return ok and result == true
+end
+
 function SubFixGenerateSelectionCore.run(options)
     options = options or {}
     runtime_options = options

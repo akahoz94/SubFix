@@ -244,6 +244,18 @@ if not ok_close then
     log_stage("绑定失败", "ScriptMatchWin.Close: " .. tostring(close_err))
 end
 
+-- 打开窗口的同时把识别服务拉起来预热：模型冷加载要 1-2 分钟，
+-- 让用户贴稿打字的那段时间去焐热模型，而不是点完「开始匹配」再干等。
+local core_root = resolve_generate_core_root(script_dir())
+local core_module = nil
+pcall(function() core_module = load_generate_core(core_root) end)
+local prewarmed = false
+if core_module and type(core_module.prewarm_asr_service) == "function" then
+    local ok_call, ok_result = pcall(function() return core_module.prewarm_asr_service() end)
+    prewarmed = ok_call and ok_result == true
+end
+log_stage("预热", prewarmed and "已拉起识别服务" or "跳过（环境未就绪或服务已在运行）")
+
 log_stage("显示窗口前")
 local ok_show, show_err = pcall(function() win:Show() end)
 if not ok_show then
@@ -292,16 +304,17 @@ end
 
 local script_file_path = nil
 local ok, err = pcall(function()
-    local root = resolve_generate_core_root(script_dir())
-    local core = load_generate_core(root)
+    if not core_module then
+        core_module = load_generate_core(core_root)
+    end
     script_file_path = write_script_temp_file(chosen.script_text)
     if not script_file_path then
         error("无法写文稿临时文件（检查 %TEMP% 可写）")
     end
-    log_stage("调管线前", "core.run 开始 root=" .. root)
+    log_stage("调管线前", "core.run 开始 root=" .. core_root)
 
-    local run_ok, run_err = core.run({
-        script_root = root,
+    local run_ok, run_err = core_module.run({
+        script_root = core_root,
         target_subtitle_track = 1,
         script_file_path = script_file_path,
         script_direct_mode = chosen.script_direct_mode
