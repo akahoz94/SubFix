@@ -422,6 +422,8 @@ def build_generate_writeback_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, Any]:
     diagnostic_keys = {
+        "stage_elapsed_seconds",
+        "progress_stage_elapsed_seconds",
         "requested_mode",
         "subtitle_mode",
         "live_engine",
