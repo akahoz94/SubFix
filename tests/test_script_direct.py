@@ -242,3 +242,21 @@ def test_window_picks_spoken_sentences_and_drops_implausible_ones():
     rows = sd.build_direct_rows(mapping, fps=25.0, timeline_start_frame=268)
     assert [r["text"] for r in rows] == [spoken.text]
     assert rows[0]["start_frame"] >= 268
+
+
+def test_every_direct_reason_code_has_a_chinese_label():
+    """回退原因没标签=用户只看到机器码，正是他投诉的"莫名变慢"。新增码必须配中文。"""
+    import re
+
+    spec_asr = importlib.util.spec_from_file_location("sd_labels", ROOT / "subfix_asr_transcribe.py")
+    asr = importlib.util.module_from_spec(spec_asr)
+    sys.modules["sd_labels"] = asr
+    spec_asr.loader.exec_module(asr)
+
+    codes: set[str] = set()
+    for name in ("subfix_script_direct.py", "subfix_asr_transcribe.py"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        codes |= set(re.findall(r'reasons\.append\("([A-Z_]+)"\)', text))
+    assert codes, "扫描不到任何质量门代码，说明这个检查本身失效了"
+    missing = sorted(code for code in codes if code not in asr.DIRECT_REASON_LABELS)
+    assert not missing, f"缺中文标签的回退原因: {missing}"

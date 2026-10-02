@@ -5707,6 +5707,10 @@ DIRECT_REASON_LABELS = {
     "SCRIPT_TOO_LONG_FOR_SELECTION": "文稿比选区里实际说的话长（贴的是整篇稿，选区只覆盖其中一段）",
     "SCRIPT_MUCH_LONGER_THAN_SELECTION": "文稿远远长于本选区（整篇一次对不齐），改用转录 + 文稿校对，不浪费十几秒",
     "COLLAPSED_ALIGNMENT_INTERVALS": "整段文稿被压进很短的音频（没照稿念，或选区太短）",
+    "COMPRESSED_ALIGNMENT_SPAN": "整段文稿只对上选区的一小段时间（稿子比实际念的多太多）",
+    "INVALID_SCRIPT_INTERVALS": "有句子的时间戳不合法（负数或超出音频范围）",
+    "NON_MONOTONIC_SCRIPT_INTERVALS": "句子先后顺序颠倒",
+    "OVERLAPPING_SCRIPT_INTERVALS": "句子之间时间重叠",
     "SCRIPT_INTERVAL_OUT_OF_BOUNDS": "文稿内容与选区里的话不是同一段",
     "UNMAPPED_SCRIPT_LINES": "有句子在音频里没被念到",
     "LOW_ALIGNMENT_COVERAGE": "文稿字符与音频对不上",
@@ -5733,6 +5737,8 @@ def try_script_direct_subtitles(
     """
     reasons: list[str] = []
     args._direct_fail_reasons = reasons
+    direct_t0 = time.monotonic()
+    direct_align_s = 0.0
     if len(batches) != 1:
         reasons.append("MULTIPLE_BATCHES_UNSUPPORTED")
         return None
@@ -5809,6 +5815,7 @@ def try_script_direct_subtitles(
             progress_path, "script_direct", "文稿直出：整段对齐中",
             batch_index=0, total_batches=1, progress_index=20, progress_total=100,
         )
+        _align_t0 = time.monotonic()
         try:
             aligner = load_qwen3_forced_aligner()
             from qwen_asr.inference.utils import normalize_audios
@@ -5819,6 +5826,7 @@ def try_script_direct_subtitles(
                 language=[qwen3_language_name(getattr(args, "language", None)) or "Chinese"],
             )
             alignment = results[0] if isinstance(results, list) and results else results
+            direct_align_s = round(time.monotonic() - _align_t0, 3)
         except Exception as exc:
             reasons.append(f"DIRECT_EXCEPTION:{type(exc).__name__}")
             diagnostic_note = str(exc)[:200]
@@ -5886,6 +5894,11 @@ def try_script_direct_subtitles(
         "diagnostic": {
             "mode": "generate_subtitles_batch",
             "generate_engine": str(getattr(args, "generate_engine", "v5") or "v5"),
+            # 直出分支在常规阶段计时点之前就 return，这里补一份，否则"文稿匹配用了多久"永远查不到
+            "stage_elapsed_seconds": {
+                "direct_total": round(time.monotonic() - direct_t0, 3),
+                "direct_align": direct_align_s,
+            },
             "script_direct": {
                 "path": "direct",
                 "line_count": len(lines),

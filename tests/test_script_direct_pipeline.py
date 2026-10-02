@@ -166,6 +166,8 @@ def _run_direct_payload(tmp_path, monkeypatch, max_chars):
     if max_chars is None:
         assert len(rows) == 3
         assert rows[0]["start_frame"] == BASE + 30, rows[0]
+    stage = payload["diagnostic"]["stage_elapsed_seconds"]
+    assert stage["direct_total"] > 0 and stage["direct_align"] >= 0, stage
     return payload, rows
 
 
