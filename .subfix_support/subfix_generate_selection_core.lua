@@ -1675,6 +1675,27 @@ local function compare_audio_source_priority(a, b)
     return (tonumber(a.item_index) or 0) < (tonumber(b.item_index) or 0)
 end
 
+-- 禁用的音频轨不送识别：备用麦/重复轨全量转录会把喂给模型的音频翻倍（实测 2.2 倍）。
+-- 读不到状态（老版本 Resolve 没这个方法、或返回 nil）就按启用处理，
+-- 绝不因为探测失败而一条字幕都不出。
+local function enabled_audio_track_indices(timeline, track_count)
+    local indices = {}
+    local skipped = {}
+    for track_index = 1, tonumber(track_count) or 0 do
+        local ok_enabled, enabled = pcall(function() return timeline:GetIsTrackEnabled("audio", track_index) end)
+        if ok_enabled and enabled == false then
+            skipped[#skipped + 1] = track_index
+        else
+            indices[#indices + 1] = track_index
+        end
+    end
+    return indices, skipped
+end
+
+function SubFixGenerateSelectionCore.enabled_audio_track_indices(timeline, track_count)
+    return enabled_audio_track_indices(timeline, track_count)
+end
+
 local function collect_audio_sources_for_scope(timeline, scope, fps)
     if type(scope) ~= "table" or scope.mode ~= WORK_SCOPE_MODE_SELECTION then
         return nil, "请先用 I/O 设置 In/Out 选区"
@@ -1692,7 +1713,15 @@ local function collect_audio_sources_for_scope(timeline, scope, fps)
 
     local audio_sources = {}
     local effective_fps = math.max(1, tonumber(fps) or 30)
-    for track_index = 1, track_count do
+    local track_indices, disabled_track_indices = enabled_audio_track_indices(timeline, track_count)
+    for _, disabled_index in ipairs(disabled_track_indices) do
+        print(string.format("[SubFix Generate] 跳过禁用音频轨 %d (%s)",
+            disabled_index, tostring(get_audio_track_display_name(timeline, disabled_index))))
+    end
+    if #track_indices == 0 then
+        return nil, "时间线的音频轨全部被禁用，请先启用要识别的那条"
+    end
+    for _, track_index in ipairs(track_indices) do
         local track_display_name = get_audio_track_display_name(timeline, track_index)
         local ok_items, items = pcall(function() return timeline:GetItemListInTrack("audio", track_index) end)
         items = ok_items and items or {}
