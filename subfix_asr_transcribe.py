@@ -7632,20 +7632,60 @@ def _serve_request(argv: list[str], host: str, port: int, connect_timeout: float
     return True
 
 
+def _serve_port_listening(port: int, host: str = "127.0.0.1") -> bool:
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+def _live_serve_ready_paths() -> list[Path]:
+    """只认真正活着的就绪文件，顺手删掉死文件。
+
+    serve 崩溃或被杀时会留下就绪文件。旧逻辑把它当"服务在忙"：转发方对着没人听的
+    端口每 2 秒空排一小时绝不回退，同时 _spawn_serve_process 又因为有就绪文件
+    拒绝拉起新实例 —— 两头堵死（实测 3 分半全片 20 分钟出不了结果）。
+    """
+    import glob
+
+    live: list[Path] = []
+    for raw_path in sorted(glob.glob(str(_serve_ready_dir() / SUBFIX_SERVE_READY_GLOB))):
+        path = Path(raw_path)
+        try:
+            port = int(json.loads(path.read_text(encoding="utf-8"))["port"])
+        except (OSError, ValueError, TypeError, KeyError):
+            path.unlink(missing_ok=True)
+            continue
+        if _serve_port_listening(port):
+            live.append(path)
+        else:
+            path.unlink(missing_ok=True)
+    return live
+
+
 def _spawn_serve_process() -> bool:
     """拉起一个 detached 常驻服务（不等待就绪）。
 
-    已有就绪文件时绝不重复拉起：实测双进程抢显存会全员掉进 sysmem fallback，
+    已有活着的服务时绝不重复拉起：实测双进程抢显存会全员掉进 sysmem fallback，
     30 秒请求拖到 21 分钟。
     """
-    import glob
     import subprocess
 
-    if sorted(glob.glob(str(_serve_ready_dir() / SUBFIX_SERVE_READY_GLOB))):
+    if _live_serve_ready_paths():
         return False
+    log_path = _serve_ready_dir() / "subfix_serve.log"
+    try:
+        # 服务崩溃必须留痕：以前 stdout/stderr 全丢进 DEVNULL，
+        # 死掉的用户只能看到"一直转不出来"，无从查起
+        handle = open(log_path, "ab")
+    except OSError:
+        handle = subprocess.DEVNULL
     popen_kwargs: dict[str, Any] = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
+        "stdout": handle,
+        "stderr": subprocess.STDOUT if handle is not subprocess.DEVNULL else subprocess.DEVNULL,
         "stdin": subprocess.DEVNULL,
     }
     if os.name == "nt":
@@ -7658,6 +7698,9 @@ def _spawn_serve_process() -> bool:
         )
     except OSError:
         return False
+    finally:
+        if handle is not subprocess.DEVNULL:
+            handle.close()
     return True
 
 
@@ -7672,11 +7715,14 @@ def try_serve_relay(argv: list[str]) -> bool:
     import glob
     import socket
 
-    ready_paths = sorted(glob.glob(str(_serve_ready_dir() / SUBFIX_SERVE_READY_GLOB)))
+    ready_paths = _live_serve_ready_paths()
     if ready_paths:
         # serve 在忙上一个请求时 accept/响应都可能慢：给足排队时间，不回退
         deadline = time.monotonic() + 3600.0
         while time.monotonic() < deadline:
+            ready_paths = _live_serve_ready_paths()
+            if not ready_paths:
+                break  # 服务中途死了：别再傻等，往下走拉起/本地执行
             for info_path in ready_paths:
                 try:
                     info = json.loads(Path(info_path).read_text(encoding="utf-8"))
