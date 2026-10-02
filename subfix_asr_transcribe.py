@@ -4167,11 +4167,47 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     return "out of memory" in str(exc).lower()
 
 
-def _read_free_gb_before_model_load() -> float | None:
-    """进程内首次调用时读取驱动空闲显存（模型尚未加载，读数即总预算）。
+def _gpu_occupied_by_others_gb() -> tuple[float, float] | None:
+    """(别人占的 GB, 整卡 GB)：（达芬奇、浏览器、微信…）此刻占了多少显存。
 
-    ponytail: 读数缓存在 _AUTO_BATCH_STATE，模型常驻后不再重估——长生命周期
-    下显存格局漂移由 OOM 减半兜底纠偏，升级路径是定期重估。
+    total - 空闲 - 我们自己已占 = 别人占的。不能用"空闲"当预算：常驻服务里
+    模型早就驻留了，空闲值天然很小；启动那一刻的快照更不会随开应用变化，
+    正是"干净桌面起的服务，后来达芬奇占了 2.5GB 还在用批 2"掉进
+    sysmem fallback（实测掉速 14 倍）的原因。
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        free_b, total_b = torch.cuda.mem_get_info()
+        ours_b = torch.cuda.memory_allocated() + torch.cuda.memory_reserved()
+        others = max(0.0, (total_b - free_b - ours_b) / 1024 ** 3)
+        return (others, total_b / 1024 ** 3)
+    except Exception:
+        return None
+
+
+def pick_inference_batch_size(readings: tuple[float, float] | None) -> int:
+    """按"别人占了多少显存"选档。阈值按实测标定（3060 Ti 8GB）：
+
+    - 别人占 3.6GB 时批 2 仍正常（60 秒素材 40 秒完成），批 1 要 59 秒；
+    - 仓库既有实测：别人占 2.5GB 且 ASR+对齐器同时驻留（约 6.4GB）时批 2 掉进
+      驱动 sysmem fallback，掉速 14 倍（6.3 分钟素材 27m46s）；
+    所以拐点取 2.0GB：宁可提前一档慢 1.4 倍，也不去赌那 14 倍。批 4 只给 12GB+ 的卡。
+    """
+    if readings is None:
+        return 1
+    others_gb, total_gb = readings
+    if others_gb > 2.0:
+        return 1
+    return 4 if total_gb >= 11.5 else 2
+
+
+def _read_free_gb_before_model_load() -> float | None:
+    """模型加载前的空闲显存读数（一次性快照，只作首请求的兜底）。
+
+    ponytail: 常驻服务改用 _gpu_occupied_by_others_gb 实时选档；此快照仅服务
+    冷启动前的普通流程，长生命周期下不再作为唯一依据。
     """
     if "preload_free_gb" in _AUTO_BATCH_STATE:
         return _AUTO_BATCH_STATE["preload_free_gb"]
@@ -4205,7 +4241,10 @@ def auto_inference_batch_size() -> int:
 
 
 def _apply_auto_batch_size(qwen_model: Any) -> None:
-    """决定本次推理批大小；优先级：手动 env > 会话内 OOM 教训 > 实时空闲分档。"""
+    """决定本次推理批大小；优先级：手动 env > min(OOM 教训, 实时显存档位)。
+
+    实时读数每请求都取：常驻服务活几小时，桌面显存格局一直在变。
+    """
     env_value = os.getenv("SUBFIX_QWEN3_ASR_MAX_BATCH")
     if env_value:
         try:
@@ -4213,11 +4252,15 @@ def _apply_auto_batch_size(qwen_model: Any) -> None:
             return
         except ValueError:
             pass
+    readings = _gpu_occupied_by_others_gb()
+    # 读不到实时显存（无 GPU / 驱动 API 抽风）才回落到启动快照那套分档
+    live = pick_inference_batch_size(readings) if readings is not None else auto_inference_batch_size()
     remembered = _AUTO_BATCH_STATE.get("value")
     if remembered:
-        qwen_model.max_inference_batch_size = remembered
-        return
-    qwen_model.max_inference_batch_size = auto_inference_batch_size()
+        # OOM 教训只能往下压，不能因为它是旧值就挡住实时降档
+        live = min(live, int(remembered))
+    qwen_model.max_inference_batch_size = live
+    _AUTO_BATCH_STATE["value"] = live
 
 
 def _transcribe_with_oom_retry(
@@ -7693,7 +7736,7 @@ def _spawn_serve_process() -> bool:
     try:
         subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "--mode", "serve",
-             "--serve-idle-timeout", str(int(os.getenv("SUBFIX_SERVE_IDLE_TIMEOUT") or "900"))],
+             "--serve-idle-timeout", str(int(os.getenv("SUBFIX_SERVE_IDLE_TIMEOUT") or "120"))],
             **popen_kwargs,
         )
     except OSError:
@@ -7747,7 +7790,7 @@ def try_serve_relay(argv: list[str]) -> bool:
     return False
 
 
-def run_serve_server(port: int = SUBFIX_SERVE_PORT_BASE, idle_timeout: float = 900.0) -> int:
+def run_serve_server(port: int = SUBFIX_SERVE_PORT_BASE, idle_timeout: float = 120.0) -> int:
     """常驻转录服务：预载模型后监听 127.0.0.1，转发 argv 请求跑完整 main 管线。
 
     模型缓存（_QWEN3_ASR_MODEL_CACHE 等）跨请求保留——第二次请求起零加载。
@@ -7938,7 +7981,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "serve":
             return run_serve_server(
                 port=int(os.getenv("SUBFIX_SERVE_PORT") or "53177"),
-                idle_timeout=float(getattr(args, "serve_idle_timeout", 900.0) or 900.0),
+                idle_timeout=float(getattr(args, "serve_idle_timeout", 120.0) or 120.0),
             )
         if args.mode == "prewarm":
             # 只负责把常驻服务拉起来就退出：模型冷加载要 1-2 分钟，
