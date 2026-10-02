@@ -6310,7 +6310,13 @@ def run_generate_subtitles_batch_plan_v4(
                     "end_frame": int(window["end_frame"]),
                     "text": str(raw_payload.get("text") or ""),
                     "asr_recovery": str(recovery_diagnostic.get("asr_recovery") or "not_needed"),
-                    "speech_seconds": float(recovery_diagnostic.get("speech_seconds") or 0.0),
+                    # 未触发回收的主窗以前留空 0.0，读诊断的人会把它当成"这段没说话"
+                    # （我就上过当）；填成实际喂给模型的音频秒数。
+                    "speech_seconds": float(
+                        recovery_diagnostic.get("speech_seconds")
+                        or audio_duration_seconds(Path(window["audio_path"]))
+                        or 0.0
+                    ),
                     "asr_empty_speech_subwindow_count": int(
                         recovery_diagnostic.get("asr_empty_speech_subwindow_count") or 0
                     ),

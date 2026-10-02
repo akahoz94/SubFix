@@ -1343,6 +1343,7 @@ local function read_selected_timeline_item_scope(timeline)
     local selected_start = nil
     local selected_end = nil
     local selected_count = 0
+    local expanded_item_count = 1
     local selected_names = {}
     local track_types = {"video", "audio"}
     for _, track_type in ipairs(track_types) do
@@ -1372,6 +1373,8 @@ local function read_selected_timeline_item_scope(timeline)
                         local item_name = get_timeline_item_name(item)
                         if item_name ~= "" and #selected_names < 3 then selected_names[#selected_names + 1] = item_name end
                         if (tonumber(expanded_count) or 1) > 1 then
+                            expanded_item_count = math.max(
+                                expanded_item_count, tonumber(expanded_count) or 1)
                             print(string.format(
                                 "[SubFix Generate] 选中片段已按相邻同素材扩展 track=%s:%d %s-%s -> %s-%s count=%d",
                                 tostring(track_type),
@@ -1397,7 +1400,10 @@ local function read_selected_timeline_item_scope(timeline)
         ))
         return build_timeline_item_scope(
             "selected_timeline_items",
-            "选中片段",
+            -- 自动扩到相邻同素材时必须在界面上说清，否则用户以为只转了选中的那一段
+            expanded_item_count > 1
+                and string.format("选中片段（自动含相邻同素材共 %d 段，请核对范围）", expanded_item_count)
+                or "选中片段",
             selected_start,
             selected_end,
             timeline_start,
@@ -1470,7 +1476,10 @@ local function find_playhead_item_scope_in_track_type(timeline, fps, track_type,
         ))
         return build_timeline_item_scope(
             "playhead_" .. track_type .. "_item",
-            source_label,
+            (tonumber(expanded_count) or 1) > 1
+                and string.format("%s（自动含相邻同素材共 %d 段，请核对范围）",
+                    source_label, tonumber(expanded_count) or 1)
+                or source_label,
             expanded_start,
             expanded_end,
             timeline_start,
