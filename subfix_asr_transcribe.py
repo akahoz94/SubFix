@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import difflib
+import hashlib
 import importlib.util
 import json
 import math
@@ -27,11 +28,21 @@ import urllib.request
 import uuid
 from types import SimpleNamespace
 import wave
+from datetime import datetime, timezone
 from collections import Counter
 from pathlib import Path
 from typing import Any
 # 隐藏子进程控制台窗口，杜绝黑框
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# Windows 控制台默认 GBK：GGUF 引擎进度里那个 📊 一打印就抛 UnicodeEncodeError，
+# auto 模式把它当成"GGUF 失败"，静默退回慢约 30 倍的 torch 批 1 路径。
+# 只替换编不出的字符，中文照旧走 GBK。
+for _stdio in (sys.stdout, sys.stderr):
+    try:
+        _stdio.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 
 
@@ -166,6 +177,7 @@ DEFAULT_MODEL = "small"
 DEFAULT_CTC_MODEL = "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn"
 HELPER_VERSION = "subfix-2026-07-13-candidate-arbitration-v5"
 TRANSCRIBE_BACKENDS = (
+    "qwen3_gguf",
     "mimo_asr",
     "qwen3_asr",
     "mlx_whisper",
@@ -173,8 +185,9 @@ TRANSCRIBE_BACKENDS = (
     "doubao_asr",
     "doubao_asr_v2",
 )
-# 豆包后端均为付费、凭据门控路径，绝不进入 "auto" 回退链；默认行为仍是
-# auto -> qwen3。只有显式 CLI/UI 选择才会调用任一豆包规格。
+# 豆包为付费凭据门控路径，绝不进 "auto" 回退链。qwen3_gguf（量化加速）在
+# auto 链首位：实测现场素材快 2-3 倍；代价是方言/嘈杂现场字符差异约 8%
+# （2026-10-24 A/B），干净口播几乎无损——在意精度可显式选 qwen3_asr。
 AUTO_TRANSCRIBE_BACKENDS = tuple(
     name for name in TRANSCRIBE_BACKENDS if name not in {"doubao_asr", "doubao_asr_v2"}
 )
@@ -274,6 +287,11 @@ DOUBAO_ASR_V2_NON_ERROR_STATUS_CODES = frozenset(
 DOUBAO_ASR_V2_MAX_QUERY_ATTEMPTS = 60
 DOUBAO_ASR_V2_QUERY_BACKOFF_SECONDS = 0.5
 DOUBAO_ASR_V2_QUERY_MAX_BACKOFF_SECONDS = 2.0
+# 外部子进程的最长等待。实测 8GB 显存吃紧时 209 秒音频要 215 秒，所以模型/对齐类
+# 一律给到十分钟级：宁可显式报超时，也不要静默挂死成"20 分钟没结果"。
+CUT_AUDIO_TIMEOUT_SECONDS = 5 * 60.0
+EXTERNAL_TRANSCRIBE_TIMEOUT_SECONDS = 15 * 60.0
+QWEN3_CPP_ALIGN_TIMEOUT_SECONDS = 10 * 60.0
 QWEN3_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 QWEN3_FORCED_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
 QWEN3_CPP_BIN_ENV = "SUBFIX_QWEN3_ASR_CPP_BIN"
@@ -411,12 +429,179 @@ def write_payload(path: Path, payload: dict[str, Any]) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+# 版本记录历史目录只保留最新 N 份，写满即删旧文件，防止常驻服务下无限增长。
+GENERATION_HISTORY_MAX_FILES = 50
+
+
+def generation_file_fingerprint(path: str | Path | None) -> dict[str, Any]:
+    if not path:
+        return {"status": "not_configured"}
+    try:
+        content = Path(path).expanduser().read_bytes()
+        return {"status": "available", "sha256": hashlib.sha256(content).hexdigest()}
+    except (OSError, ValueError) as exc:
+        return {"status": "unavailable", "error_type": type(exc).__name__}
+
+
+def generation_profile_path(path: str | Path | None, engine: str) -> Path:
+    raw_path = path or os.getenv(SEGMENTATION_PROFILE_ENV)
+    names = {"v3": "segmentation_profile.json", "v4": "segmentation_profile_v3.json", "v5": "segmentation_profile_v4.json"}
+    return Path(raw_path).expanduser() if raw_path else Path(__file__).resolve().with_name(names[engine])
+
+
+def load_generation_profile(args: argparse.Namespace, engine: str) -> tuple[dict[str, Any] | None, str]:
+    path = getattr(args, "segmentation_profile", None)
+    if engine == "v5":
+        profile, status = load_segmentation_profile_v5(path)
+    else:
+        loader = load_segmentation_profile if engine == "v3" else load_segmentation_profile_v4
+        profile = loader(path)
+        status = "loaded" if profile is not None else "not_loaded"
+    trace = getattr(args, "generation_trace", None)
+    if isinstance(trace, dict):
+        # 用加载器实际命中的 _path 做指纹，避免 env/默认路径解析出第二个不同文件时记错。
+        actual_path = (profile or {}).get("_path") or generation_profile_path(path, engine)
+        fingerprint = generation_file_fingerprint(actual_path)
+        trace.setdefault("profile_loads", []).append({
+            "engine": engine,
+            "source": "argument" if path else "environment" if os.getenv(SEGMENTATION_PROFILE_ENV) else "default",
+            "load_status": status,
+            "schema_version": str((profile or {}).get("schema_version") or ""),
+            "fingerprint": fingerprint,
+        })
+        trace["profile_fingerprint"] = fingerprint
+        trace["profile_load_status"] = status
+    return profile, status
+
+
+def start_generation_trace(args: argparse.Namespace) -> dict[str, Any]:
+    helper_root = Path(__file__).resolve().parent
+    plugin_source = getattr(args, "plugin_source", None)
+    plugin_version = "unknown"
+    if plugin_source:
+        # 只抽取版本号字符串，插件文件正文不进记录，绝不落本地绝对路径。
+        try:
+            match = re.search(r'\bSUBFIX_VERSION\s*=\s*["\']([0-9A-Za-z.+_-]+)["\']', Path(plugin_source).read_text(encoding="utf-8"))
+            if match:
+                plugin_version = match.group(1)
+        except (OSError, UnicodeError, ValueError):
+            pass
+    sources = {
+        "helper": Path(__file__),
+        "plugin": plugin_source,
+        "generation_core": getattr(args, "generation_core_source", None),
+        "generate_v4": helper_root / "subfix_generate_v4.py",
+        "generate_v5": helper_root / "subfix_generate_v5.py",
+        "textnorm": helper_root / "subfix_generate_textnorm.py",
+    }
+    return {
+        "schema_version": "subfix_generation_trace_v1",
+        "run_id": str(uuid.uuid4()),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "helper_version": HELPER_VERSION,
+        "plugin_version": plugin_version,
+        "code_fingerprints": {key: generation_file_fingerprint(path) for key, path in sources.items()},
+        "profile_fingerprint": generation_file_fingerprint(generation_profile_path(getattr(args, "segmentation_profile", None), args.generate_engine)),
+        "hotwords_fingerprint": generation_file_fingerprint(getattr(args, "hotwords_json", None)),
+        "parameters": {
+            "requested_backend": args.backend,
+            "requested_model": Path(str(args.model)).name,
+            "requested_generate_engine": args.generate_engine,
+            "mode": args.mode,
+            "subtitle_mode": args.subtitle_mode,
+            "language": args.language,
+            "fps": args.fps,
+            "max_chars": getattr(args, "max_chars", None),
+            "v5_writeback_mode": v5_writeback_mode(),
+            "batch_max_seconds": generate_subtitles_batch_max_seconds(),
+        },
+        "asr_sources": [],
+    }
+
+
+def record_generation_asr(args: argparse.Namespace, payload: dict[str, Any], role: str = "primary") -> None:
+    trace = getattr(args, "generation_trace", None)
+    if not isinstance(trace, dict):
+        return
+    backend = str(payload.get("backend") or ("fixture" if getattr(args, "fixture_json", None) else "unknown"))
+    source: dict[str, Any] = {"backend": backend, "role": role}
+    diagnostic = payload.get("diagnostic") or {}
+    if backend in {"doubao_asr", "doubao_asr_v2"}:
+        # 适配器收到的是 Whisper 兼容的 CLI model，但云请求实际用 bigmodel，服务不暴露其修订号。
+        source.update(model="bigmodel", model_revision=None, model_identity_source="service_request")
+        # 豆包逐次 payload 用单数 resource_id，聚合诊断去重成 doubao_resource_ids 列表：两处都兜住，指纹才不会空。
+        resource_ids = diagnostic.get("resource_id") or (diagnostic.get("doubao_resource_ids") or [""])[0]
+        resource_id = str(resource_ids or "")
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,100}", resource_id):
+            source["resource_id"] = resource_id
+    else:
+        source.update(model=Path(str(payload.get("model") or "unknown")).name, model_identity_source="backend_result")
+    if source not in trace["asr_sources"]:
+        trace["asr_sources"].append(source)
+
+
+def finish_generation_trace(args: argparse.Namespace, payload: dict[str, Any]) -> None:
+    trace = getattr(args, "generation_trace", None)
+    if not isinstance(trace, dict):
+        return
+    diagnostic = payload.get("diagnostic") or {}
+    rows = payload.get("subtitle_rows") or []
+    # 只落行文本的哈希与帧范围，字幕正文绝不进记录。
+    result_rows = [{key: row.get(key) for key in ("start_frame", "end_frame", "text")} for row in rows]
+    trace.update(
+        finished_at=datetime.now(timezone.utc).isoformat(),
+        ok=payload.get("ok") is True,
+        generate_engine=diagnostic.get("generate_engine") or args.generate_engine,
+        profile_load_status=trace.get("profile_load_status", diagnostic.get("profile_load_status", "not_reported")),
+        subtitle_count=len(rows),
+        subtitle_result_sha256=hashlib.sha256(json.dumps(result_rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+    )
+    if rows:
+        trace["result_frame_range"] = {
+            "start_frame": min(int(row.get("start_frame") or 0) for row in rows),
+            "end_frame": max(int(row.get("end_frame") or 0) for row in rows),
+        }
+    history_root = Path(args.diagnostic_output or args.output).expanduser().parent / "generation_history"
+    trace["history_status"] = "saved"
+    try:
+        write_payload(history_root / (trace["run_id"] + ".json"), dict(trace))
+        stored_files = sorted(history_root.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+        for stale in stored_files[GENERATION_HISTORY_MAX_FILES:]:
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except (OSError, ValueError, TypeError) as exc:
+        trace["history_status"] = "failed"
+        trace["history_error_type"] = type(exc).__name__
+    payload["generation_trace"] = trace
+
+
+def write_generation_diagnostic(args: argparse.Namespace, payload: dict[str, Any]) -> None:
+    if not getattr(args, "diagnostic_output", None):
+        return
+    batch_decision = _AUTO_BATCH_STATE.get("batch_decision")
+    if isinstance(batch_decision, dict):
+        # 批大小决策生在 ASR 深处、是进程级状态，落诊断时统一并入本轮 diagnostic
+        payload.setdefault("diagnostic", {}).update(batch_decision)
+    try:
+        write_payload(Path(args.diagnostic_output).expanduser(), sanitize_generate_diagnostic_payload(payload))
+    except OSError as exc:
+        trace = payload.get("generation_trace")
+        if isinstance(trace, dict):
+            trace["diagnostic_status"] = "failed"
+            trace["diagnostic_error_type"] = type(exc).__name__
+        print(f"[subfix] 生成诊断未保存: {type(exc).__name__}", file=sys.stderr)
+
+
 def build_generate_writeback_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    trace = {"generation_trace": payload["generation_trace"]} if "generation_trace" in payload else {}
     if payload.get("ok") is False:
-        return {"ok": False, "error": str(payload.get("error") or "ASR helper 执行失败")}
+        return {"ok": False, "error": str(payload.get("error") or "ASR helper 执行失败"), **trace}
     return {
         "ok": True,
         "subtitle_rows": list(payload.get("subtitle_rows") or []),
+        **trace,
     }
 
 
@@ -537,6 +722,24 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "doubao_log_ids",
         "doubao_resource_ids",
         "doubao_status_codes",
+        # 推理批决策（为什么这次特别慢）：不在白名单就等于没埋点
+        "inference_batch_size",
+        "inference_batch_reason",
+        "inference_batch_message",
+        "inference_batch_capped_by",
+        "inference_batch_gpu_gb",
+        # 文稿校对：同音纠错跑没跑、改了多少，必须留得下
+        "proofread_schema",
+        "proofread_status",
+        "proofread_pinyin_available",
+        "proofread_unavailable_reason",
+        "proofread_script_chars",
+        "proofread_block_count",
+        "proofread_homophone_replace_count",
+        "proofread_punctuation_replace_count",
+        "proofread_structure_kept_count",
+        "proofread_cross_row_kept_count",
+        "proofread_changed_row_count",
     }
     row_keys = {
         "index",
@@ -633,13 +836,43 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "diagnostic": diagnostic,
         "batches": batch_summaries,
         "subtitle_rows": subtitle_rows,
+        **({"generation_trace": payload["generation_trace"]} if "generation_trace" in payload else {}),
     }
 
 
 _PROGRESS_STAGE_TIMES: dict[str, float] = {}
+# 本地 Qwen 的 ASR 和强制对齐都跑在本进程里，模型加载点拿不到 progress_path，
+# 所以用最近一次真实进度写入当环境上下文，把 25% 停滞归到具体阶段上。
+# 阶段写入不回写环境上下文，否则阶段消息会把批次进度顶掉。
+_PROGRESS_CONTEXT: tuple[Path, dict[str, Any]] | None = None
+_PROGRESS_CONTEXT_KEYS = ("batch_index", "total_batches", "progress_index", "progress_total", "indeterminate")
+# 阶段机器码沿用上游 v3.3.3 的同名码，界面文案照上游四条，后续同步不必再改名。
+QWEN_LOCAL_PHASE_LABELS = {
+    "load_qwen_model": "正在加载语音模型",
+    "run_qwen_asr": "正在识别语音",
+    "load_qwen_aligner": "正在加载字幕对齐模型",
+    "qwen_align": "正在对齐字幕时间",
+}
+
+
+def _attach_batch_decision(payload: dict[str, Any], stage: str) -> None:
+    """把开跑时的理批决策挂到之后每一条进度上。
+
+    决策条本身只在决策那一刻写一次，紧接着就被"转写 x/56"顶掉，界面每 200ms 读
+    一次文件，用户永远看不到它——于是"这跑为什么这么慢"只能靠事后翻进程才能答。
+    这里把决策随每条进度一起带出去，任何时刻截图都带着原因。
+    """
+    if stage == "inference_batch_size":
+        return
+    decision = _AUTO_BATCH_STATE.get("batch_decision")
+    if not isinstance(decision, dict):
+        return
+    payload["inference_batch_size"] = decision.get("inference_batch_size")
+    payload["inference_batch_message"] = decision.get("inference_batch_message")
 
 
 def write_progress(path: Path | None, stage: str, message: str, **extra: Any) -> None:
+    global _PROGRESS_CONTEXT
     if stage and stage not in _PROGRESS_STAGE_TIMES:
         _PROGRESS_STAGE_TIMES[stage] = time.monotonic()
     if not path:
@@ -651,11 +884,27 @@ def write_progress(path: Path | None, stage: str, message: str, **extra: Any) ->
         "helper_version": HELPER_VERSION,
     }
     payload.update(extra)
+    if stage:
+        payload["elapsed_seconds"] = round(time.monotonic() - _PROGRESS_STAGE_TIMES[stage], 1)
+    _attach_batch_decision(payload, stage)
+    if not extra.get("local_phase"):
+        _PROGRESS_CONTEXT = (path, payload)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Lua 侧每 200ms 正则读这个文件，必须写临时文件再原子替换，否则会读到半截 JSON。
+        write_payload(path, payload)
     except OSError:
         pass
+
+
+def write_qwen_local_phase(stage: str) -> None:
+    """把本地 Qwen 阶段并进最近一条进度消息：进度条停在原处，但用户看得出卡在哪一步。"""
+    if _PROGRESS_CONTEXT is None:
+        return
+    path, context = _PROGRESS_CONTEXT
+    label = QWEN_LOCAL_PHASE_LABELS[stage]
+    base_message = str(context.get("message") or "")
+    extra = {key: context[key] for key in _PROGRESS_CONTEXT_KEYS if key in context}
+    write_progress(path, stage, f"{base_message} · {label}" if base_message else label, local_phase=True, **extra)
 
 
 def generate_batch_progress_total(total_batches: int) -> int:
@@ -3953,7 +4202,17 @@ def cut_audio(
     if audio_channel_index is not None and audio_channel_index > 0:
         cmd.extend(["-filter:a", f"pan=mono|c0=c{audio_channel_index - 1}"])
     cmd.extend(["-ac", "1", "-ar", "16000", "-vn", str(output)])
-    subprocess.run(cmd, check=True, text=True, capture_output=True, creationflags=CREATE_NO_WINDOW)
+    try:
+        subprocess.run(
+            cmd, check=True, text=True, capture_output=True,
+            creationflags=CREATE_NO_WINDOW, timeout=CUT_AUDIO_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"ffmpeg 截取音频超过 {CUT_AUDIO_TIMEOUT_SECONDS:.0f} 秒仍未完成，已终止："
+            f"{audio} 起始 {source_start:.1f} 秒。音频源可能损坏或磁盘繁忙，"
+            "请缩短选区后重试，或改用云端识别"
+        ) from exc
 
 
 def transcribe_mlx_whisper(audio_path: Path, model: str, language: str | None) -> dict[str, Any]:
@@ -4102,8 +4361,10 @@ def load_qwen3_forced_aligner() -> Any:
 
 
 def qwen3_force_align_items(audio_path: Path, text: str, language: str) -> list[dict[str, Any]]:
+    write_qwen_local_phase("load_qwen_aligner")
     aligner = load_qwen3_forced_aligner()
     try:
+        write_qwen_local_phase("qwen_align")
         results = aligner.align(audio=str(audio_path), text=str(text), language=str(language))
     except Exception as exc:  # pragma: no cover - optional local runtime/model execution
         raise RuntimeError(f"Qwen3-ForcedAligner 对齐失败: {exc}") from exc
@@ -4158,6 +4419,11 @@ def qwen3_result_to_payload(
 
 _AUTO_BATCH_STATE: dict[str, Any] = {}
 
+# 回升余量：降档按 pick_inference_batch_size 的 2.0GB 拐点，回升要求比拐点再低
+# 0.2GB。阈值边界上来回抖动的代价（每换一次批大小，库内激活缓冲都要重排）比
+# 稳定待在低档更贵，所以只对"往上爬"加迟滞，往下掉永远立即生效。
+_BATCH_CLIMB_MARGIN_GB = 1.8
+
 
 def _is_cuda_oom(exc: BaseException) -> bool:
     try:
@@ -4176,15 +4442,40 @@ def _gpu_occupied_by_others_gb() -> tuple[float, float] | None:
     模型早就驻留了，空闲值天然很小；启动那一刻的快照更不会随开应用变化，
     正是"干净桌面起的服务，后来达芬奇占了 2.5GB 还在用批 2"掉进
     sysmem fallback（实测掉速 14 倍）的原因。
+
+    ⚠ "我们自己已占"只能取 memory_reserved()。它是缓存分配器向驱动申请的总量，
+    已经把 memory_allocated() 包在里面；旧实现写的是 allocated + reserved，
+    等于把已分配部分算两遍。8GB 卡上模型驻留 6.4GB 时 ours 被算成 12GB+，
+    于是 others = max(0, 8.0 - 0.07 - 12.4) 恒等于 0.0——选档函数永远看到
+    "没人占显存"，每一窗都选批 2。实测后果：39 分钟素材跑 72 分钟，RTF 1.85，
+    比批 1 基准还慢 89%（前 50 窗 RTF 1.62，后 4 窗 5.62，越跑越慢）。
+
+    ⚠ free 掉到 0.5GB 以下时三个数不再自洽：驱动已在把页面往系统内存挪，
+    others 会系统性低估（实测低估一半以上）。这种读数不能拿来选档，
+    返回 None 让上层退回批 1 保命档。
     """
+    _AUTO_BATCH_STATE.pop("gpu_gb", None)  # 读不到就不许把上一轮的陈旧数字播给这一轮
     try:
         import torch
         if not torch.cuda.is_available():
             return None
         free_b, total_b = torch.cuda.mem_get_info()
-        ours_b = torch.cuda.memory_allocated() + torch.cuda.memory_reserved()
+        # reserved ⊇ allocated，只取 reserved；两者相加会把已分配算两遍
+        ours_b = torch.cuda.memory_reserved()
+        free_gb = free_b / 1024 ** 3
+        total_gb = total_b / 1024 ** 3
         others = max(0.0, (total_b - free_b - ours_b) / 1024 ** 3)
-        return (others, total_b / 1024 ** 3)
+        _AUTO_BATCH_STATE["gpu_gb"] = {
+            "others": round(others, 1),
+            "free": round(free_gb, 1),
+            "ours": round(ours_b / 1024 ** 3, 1),
+            "total": round(total_gb, 1),
+        }
+        if free_gb < 0.5:
+            # 卡已经满了：此刻无论 others 算出多少都是低估，不能据此放大批
+            _AUTO_BATCH_STATE["gpu_gb"]["unreliable"] = True
+            return None
+        return (others, total_gb)
     except Exception:
         return None
 
@@ -4192,10 +4483,14 @@ def _gpu_occupied_by_others_gb() -> tuple[float, float] | None:
 def pick_inference_batch_size(readings: tuple[float, float] | None) -> int:
     """按"别人占了多少显存"选档。阈值按实测标定（3060 Ti 8GB）：
 
-    - 别人占 3.6GB 时批 2 仍正常（60 秒素材 40 秒完成），批 1 要 59 秒；
-    - 仓库既有实测：别人占 2.5GB 且 ASR+对齐器同时驻留（约 6.4GB）时批 2 掉进
+    - 批 1 基准：60 秒素材 59 秒（RTF≈0.98）；批 2：40 秒（RTF≈0.67），约 1.5 倍；
+    - 失败实测：别人占 2.5GB 且 ASR+对齐器同时驻留（约 6.4GB）时批 2 掉进
       驱动 sysmem fallback，掉速 14 倍（6.3 分钟素材 27m46s）；
-    所以拐点取 2.0GB：宁可提前一档慢 1.4 倍，也不去赌那 14 倍。批 4 只给 12GB+ 的卡。
+    所以拐点取 2.0GB：宁可提前一档慢 1.5 倍，也不去赌那 14 倍。批 4 只给 12GB+ 的卡。
+
+    ⚠ 旧注释里"别人占 3.6GB 时批 2 仍正常"来自单模型旧架构（只驻留 ASR），
+    与现在两模型同时驻留的 6.4GB 占用不可比。别再拿它当放宽拐点的依据——
+    照它把拐点提到 3.5GB 会直接复现那 14 倍。
     """
     if readings is None:
         return 1
@@ -4242,27 +4537,93 @@ def auto_inference_batch_size() -> int:
     return 1
 
 
+def _report_batch_decision(batch: int, readings: tuple[float, float] | None, capped_by: str = "") -> None:
+    """开跑那一刻就把"为什么这次特别慢"说出来：批大小 + 实测显存数字。
+
+    决策每窗都会重算（常驻服务里桌面显存格局一直在变），逐条播会刷屏：按消息
+    去重，只有档位或显存格局真的变了才再播一条；诊断里永远留最新一份。
+    """
+    gpu = _AUTO_BATCH_STATE.get("gpu_gb")
+    gpu = dict(gpu) if isinstance(gpu, dict) else {}
+    if capped_by == "env_override":
+        message = f"推理批 {batch}｜手动指定 SUBFIX_QWEN3_ASR_MAX_BATCH"
+    else:
+        parts = [f"推理批 {batch}｜"]
+        if readings is None:
+            if gpu.get("unreliable"):
+                # 满卡：others 被系统性低估，宁可报清楚也不假装读到了
+                parts.append(
+                    f"显存已满（空闲 {float(gpu.get('free', 0)):.1f}GB），"
+                    "占用读数不可信，退回保命档"
+                )
+            else:
+                parts.append("实时显存读数不可用，按启动快照分档")
+        else:
+            others_gb, total_gb = readings
+            parts.append(f"其他进程已占 {others_gb:.1f}GB")
+            if "free" in gpu:
+                parts.append(f"，空闲 {float(gpu['free']):.1f}GB")
+            parts.append(f"（{total_gb:.0f}GB 卡）")
+        if capped_by == "oom_lesson":
+            parts.append(" · 已按上次显存溢出教训降档")
+        elif capped_by == "climb_needs_margin":
+            parts.append(" · 显存有回升但余量不足，维持低档")
+        elif readings is not None and batch <= 1:
+            parts.append(" · 已降到保命档")
+        message = "".join(parts)
+    _AUTO_BATCH_STATE["batch_decision"] = {
+        "inference_batch_size": int(batch),
+        "inference_batch_reason": capped_by
+        or ("no_live_vram_reading" if readings is None else "live_vram"),
+        "inference_batch_message": message,
+        "inference_batch_capped_by": capped_by,
+        "inference_batch_gpu_gb": gpu,
+    }
+    if _PROGRESS_CONTEXT is None or _AUTO_BATCH_STATE.get("batch_reported") == message:
+        return
+    path, context = _PROGRESS_CONTEXT
+    extra = {key: context[key] for key in _PROGRESS_CONTEXT_KEYS if key in context}
+    write_progress(path, "inference_batch_size", message, **extra)
+    _AUTO_BATCH_STATE["batch_reported"] = message
+
+
 def _apply_auto_batch_size(qwen_model: Any) -> None:
-    """决定本次推理批大小；优先级：手动 env > min(OOM 教训, 实时显存档位)。
+    """决定本次推理批大小；优先级：手动 env > OOM 硬地板 > 实时显存档位。
 
     实时读数每请求都取：常驻服务活几小时，桌面显存格局一直在变。
+    降档立即生效；回升要求显存比拐点再宽松 _BATCH_CLIMB_MARGIN_GB，防止抖动。
+
+    旧实现把"本会话见过的低档"当成单向棘轮（min(live, remembered)）：一次早高峰
+    读到别人占 3.2GB，就把后面几十个窗口全钉在批 1——实测 40 分钟素材因此多花
+    近一倍时间，而中途显存早就回落了。常规降档只代表"此刻挤"，不是"溢出过"，
+    不该有永久效力；真溢出（_is_cuda_oom）才记 oom_batch 当硬地板。
     """
     env_value = os.getenv("SUBFIX_QWEN3_ASR_MAX_BATCH")
     if env_value:
         try:
-            qwen_model.max_inference_batch_size = max(1, int(env_value))
+            batch = max(1, int(env_value))
+            qwen_model.max_inference_batch_size = batch
+            _report_batch_decision(batch, None, "env_override")
             return
         except ValueError:
             pass
     readings = _gpu_occupied_by_others_gb()
     # 读不到实时显存（无 GPU / 驱动 API 抽风）才回落到启动快照那套分档
     live = pick_inference_batch_size(readings) if readings is not None else auto_inference_batch_size()
-    remembered = _AUTO_BATCH_STATE.get("value")
-    if remembered:
-        # OOM 教训只能往下压，不能因为它是旧值就挡住实时降档
-        live = min(live, int(remembered))
+    current = int(getattr(qwen_model, "max_inference_batch_size", 1) or 1)
+    capped_by = ""
+    oom_batch = int(_AUTO_BATCH_STATE.get("oom_batch") or 0)
+    if oom_batch and live > oom_batch:
+        # 真溢出过的档位是硬地板：本会话内不许爬回去，这是那 14 倍的唯一保险
+        live = oom_batch
+        capped_by = "oom_lesson"
+    elif readings is not None and live > current and readings[0] > _BATCH_CLIMB_MARGIN_GB:
+        # 显存确实宽松了，但还没松到能抵消抖动的程度 → 这一窗先维持低档
+        live = current
+        capped_by = "climb_needs_margin"
     qwen_model.max_inference_batch_size = live
     _AUTO_BATCH_STATE["value"] = live
+    _report_batch_decision(live, readings, capped_by)
 
 
 def _transcribe_with_oom_retry(
@@ -4286,8 +4647,10 @@ def _transcribe_with_oom_retry(
         except Exception:
             pass
         # 会话内记住降档结果：缓存模型对象属性天然跨调用生效，这里再记一份
-        # 防模型缓存键变化后重新加载时丢失教训。
+        # 防模型缓存键变化后重新加载时丢失教训。oom_batch 单独记一笔，让"为什么
+        # 压到这一档"能分清显存溢出与常规降档，播报不许把后者说成溢出。
         _AUTO_BATCH_STATE["value"] = halved
+        _AUTO_BATCH_STATE["oom_batch"] = halved
         qwen_model.max_inference_batch_size = halved
         return _transcribe_qwen3_model(qwen_model, audio, language, context)
 
@@ -4322,22 +4685,44 @@ def transcribe_qwen3_asr(
 _ALIGN_CHUNK_SECONDS = 180
 
 
+def _asr_chunk_seconds() -> int:
+    """ASR 切块时长按显存分档。
+
+    实测（3060 Ti 8GB，2026-10-23）：180 秒单块激活超出物理显存，驱动静默
+    sysmem fallback，同素材 63.5~81.9s；切块 60 秒后 19.6s（3~4 倍），峰值
+    6.96GB 安全，文字产出一致。12GB+ 卡维持 180 秒。读不到显存按小卡兜底。
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            total_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+            return 60 if total_gb < 11.5 else 180
+    except Exception:
+        pass
+    return 60
+
+
 def transcribe_qwen3_asr_batch(
     audio_paths: list[Path], model: str, language: str | None, context: str | None = None
 ) -> list[dict[str, Any]]:
     """两阶段 Qwen3-ASR：块级纯文本 ASR + 独立对齐器显式对齐。
 
     与库内 transcribe(return_time_stamps=True) 同语义（normalize→180s 低能量
-    切块→块级 ASR→块音频配块文本对齐→offset 修正合并），但两个模型分时驻留：
-    ASR 阶段无对齐器的 1.2GB，批内激活预算更大；对齐阶段 ASR 权重的缓存可被
-    部分复用，峰值显存更低。块文本来自 ASR 阶段自身（切块对齐必须块对块，
-    喂全文会导致每块重复对齐全文——实测对齐项膨胀 3 倍、时间轴越界）。
+    切块→块级 ASR→块音频配块文本对齐→offset 修正合并）。块文本来自 ASR 阶段
+    自身（切块对齐必须块对块，喂全文会导致每块重复对齐全文——实测对齐项膨胀
+    3 倍、时间轴越界）。
+
+    注意"分时驻留"只在首窗成立：ASR 阶段先不建对齐器，省下 1.2GB；但
+    _QWEN3_ASR_MODEL_CACHE / _QWEN3_FORCED_ALIGNER_CACHE 跨窗保留，从第 2 个
+    窗口起两个模型同时驻留（约 6.4GB）。别按"常驻只有 3.4GB"去放宽
+    pick_inference_batch_size 的拐点，那正是 14 倍 sysmem fallback 的入口。
     """
     if not audio_paths:
         return []
     from qwen_asr.inference.qwen3_forced_aligner import ForcedAlignResult
     from qwen_asr.inference.utils import normalize_audios, split_audio_into_chunks
 
+    write_qwen_local_phase("load_qwen_model")
     qwen_model, model_name, aligner_name, device_map = load_qwen3_asr_model(model)
     try:
         wavs = normalize_audios([str(path) for path in audio_paths])
@@ -4348,12 +4733,18 @@ def transcribe_qwen3_asr_batch(
     chunk_offsets: list[float] = []
     chunk_audios: list[tuple[Any, int]] = []
     for owner, wav in enumerate(wavs):
-        for chunk_wav, offset_sec in split_audio_into_chunks(wav, 16000, _ALIGN_CHUNK_SECONDS):
+        _chunk_seconds = os.getenv("SUBFIX_ASR_CHUNK_SECONDS")
+        chunk_seconds = (
+            int(_chunk_seconds) if _chunk_seconds and _chunk_seconds.isdigit() and int(_chunk_seconds) >= 20
+            else _asr_chunk_seconds()
+        )
+        for chunk_wav, offset_sec in split_audio_into_chunks(wav, 16000, chunk_seconds):
             chunk_owners.append(owner)
             chunk_offsets.append(float(offset_sec))
             chunk_audios.append((chunk_wav, 16000))
 
     # 阶段 1：块级纯文本 ASR——无对齐器驻留，批内激活预算更大
+    write_qwen_local_phase("run_qwen_asr")
     try:
         results, hotword_context_status = _transcribe_with_oom_retry(
             qwen_model, chunk_audios, language, context, return_time_stamps=False
@@ -4372,15 +4763,29 @@ def transcribe_qwen3_asr_batch(
     non_empty = [i for i, text in enumerate(chunk_texts) if text.strip()]
     align_results: list[Any | None] = [None] * len(chunk_audios)
     if non_empty:
+        write_qwen_local_phase("load_qwen_aligner")
+        aligner = load_qwen3_forced_aligner()
+        write_qwen_local_phase("qwen_align")
+        align_audios = [chunk_audios[i] for i in non_empty]
+        align_texts = [chunk_texts[i] for i in non_empty]
+        align_langs = [chunk_langs[i] for i in non_empty]
         try:
-            aligner = load_qwen3_forced_aligner()
-            aligned = aligner.align(
-                audio=[chunk_audios[i] for i in non_empty],
-                text=[chunk_texts[i] for i in non_empty],
-                language=[chunk_langs[i] for i in non_empty],
-            )
+            aligned = aligner.align(audio=align_audios, text=align_texts, language=align_langs)
         except Exception as exc:  # pragma: no cover - depends on optional local runtime
-            raise RuntimeError(f"Qwen3-ForcedAligner 对齐失败: {exc}") from exc
+            if len(non_empty) <= 1 or not _is_cuda_oom(exc):
+                raise RuntimeError(f"Qwen3-ForcedAligner 对齐失败: {exc}") from exc
+            # 喂入批放大后，对齐阶段一次吃不下这批窗：退成逐条对齐，别让整跑失败。
+            # 只降对齐批、不动 ASR 批，因为喂入批的收益在 ASR 侧，对齐侧本来就短。
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except Exception:
+                pass
+            aligned = []
+            for one_audio, one_text, one_lang in zip(align_audios, align_texts, align_langs):
+                single = aligner.align(audio=[one_audio], text=[one_text], language=[one_lang])
+                aligned.append(single[0] if isinstance(single, list) and single else single)
         for i, result in zip(non_empty, aligned):
             align_results[i] = result
 
@@ -4416,6 +4821,35 @@ def transcribe_qwen3_asr_batch(
             )
         )
     return payloads
+
+
+# auto 模式下 GGUF 中途失败的原因记录（诊断用；每个进程只记最近一次）
+_GGUF_FALLBACK_STATE: dict[str, str] = {}
+
+
+def qwen3_gguf_auto_candidate() -> bool:
+    """auto 模式下是否优先尝试 GGUF 后端（运行时+模型齐全且未被 env 关闭）。"""
+    try:
+        import subfix_qwen3_gguf as gguf
+
+        return gguf._engine_available()
+    except Exception:
+        return False
+
+
+def transcribe_qwen3_gguf(
+    audio_path: Path, language: str | None, context: str | None = None
+) -> dict[str, Any]:
+    """Qwen3-ASR GGUF 混合推理（ONNX-DML encoder + Vulkan decoder）。
+
+    环境不齐时快速抛错，auto 链据此回退 qwen3_asr；显式选择时错误如实上报。
+    """
+    import subfix_qwen3_gguf as gguf
+
+    reason = gguf.unavailable_reason()
+    if reason:
+        raise RuntimeError(f"{reason}，回退其他后端")
+    return gguf.transcribe_payload(audio_path, language, context=context)
 
 
 def _doubao_credentials_path() -> Path:
@@ -4813,6 +5247,34 @@ def transcribe_v4_window_batch(
     backend = str(getattr(args, "backend", "auto") or "auto")
     if backend not in {"doubao_asr", "doubao_asr_v2"}:
         hotword_context = str(getattr(args, "hotword_context", "") or "")
+        gguf_requested = backend == "qwen3_gguf" or (
+            backend == "auto" and qwen3_gguf_auto_candidate()
+        )
+        gguf_error: str | None = None
+        if gguf_requested:
+            try:
+                payloads = [
+                    transcribe_qwen3_gguf(path, args.language, context=hotword_context)
+                    for path in window_audio_paths
+                ]
+                diagnostic = {
+                    "asr_backend_used": "qwen3_gguf",
+                    "doubao_fallback_count": 0,
+                }
+                if hotword_context:
+                    diagnostic["hotword_context_supported"] = True
+                # GGUF 主转写成功：本进程已驻留 CUDA DLL，torch 的 cublas 与之
+                # 同名冲突（WinError 127），对齐/重试必须留在 GGUF 家族内
+                _GGUF_FALLBACK_STATE["primary_used"] = True
+                return payloads, diagnostic
+            except Exception as exc:
+                if backend == "qwen3_gguf":
+                    raise
+                # auto：GGUF 中途失败回退 torch 路径。原因必须可见——写诊断、
+                # 写进度，否则用户只能感到"莫名变慢"，无从修起
+                gguf_error = str(exc)
+                _GGUF_FALLBACK_STATE["primary_used"] = False
+                _GGUF_FALLBACK_STATE["last_error"] = gguf_error
         payloads = (
             transcribe_qwen3_asr_batch(
                 window_audio_paths, args.model, args.language, context=hotword_context
@@ -4824,6 +5286,8 @@ def transcribe_v4_window_batch(
             "asr_backend_used": "qwen3_asr",
             "doubao_fallback_count": 0,
         }
+        if gguf_error:
+            diagnostic["gguf_fallback_error"] = gguf_error[:300]
         if hotword_context:
             context_statuses = {
                 str((payload.get("diagnostic") or {}).get("hotword_context_status") or "not_requested")
@@ -4883,7 +5347,16 @@ def transcribe_external_backend(audio_path: Path, model: str, language: str | No
             model=shlex.quote(str(model)),
             language=shlex.quote(str(language or "auto")),
         )
-        result = subprocess.run(command, shell=True, text=True, capture_output=True, creationflags=CREATE_NO_WINDOW)
+        try:
+            result = subprocess.run(
+                command, shell=True, text=True, capture_output=True,
+                creationflags=CREATE_NO_WINDOW, timeout=EXTERNAL_TRANSCRIBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"{backend} 识别超过 {EXTERNAL_TRANSCRIBE_TIMEOUT_SECONDS:.0f} 秒仍未返回，已终止："
+                "本地命令可能挂死或音频过长，请缩短选区后重试，或改用本地 Qwen/云端识别"
+            ) from exc
         if result.returncode != 0:
             error_text = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(f"{backend} 执行失败: {error_text}")
@@ -4921,6 +5394,8 @@ def transcribe_with_backend(
                 payload = transcribe_mlx_whisper(audio_path, model, language)
             elif candidate == "openai_whisper":
                 payload = transcribe_openai_whisper(audio_path, model, language)
+            elif candidate == "qwen3_gguf":
+                payload = transcribe_qwen3_gguf(audio_path, language, context=context)
             elif candidate == "qwen3_asr":
                 payload = (
                     transcribe_qwen3_asr(audio_path, model, language, context=context)
@@ -4965,6 +5440,9 @@ def transcribe_v4_retry_audio(
         return transcribe_doubao_asr(audio_path, model, language)
     if backend == "doubao_asr_v2":
         return transcribe_doubao_asr_v2(audio_path, model, language)
+    if backend == "auto" and _GGUF_FALLBACK_STATE.get("primary_used"):
+        # CUDA DLL 驻留的进程里 torch 不可用，重试留在 GGUF 家族内
+        return transcribe_qwen3_gguf(audio_path, language)
     return (
         transcribe_qwen3_asr(audio_path, model, language, context=hotword_context)
         if hotword_context
@@ -4980,6 +5458,16 @@ def align_v4_retry_audio(
     backend: str,
 ) -> list[dict[str, Any]]:
     """Provide fallback timestamps without crossing ASR backend boundaries."""
+    if backend == "qwen3_gguf":
+        import subfix_qwen3_gguf as gguf
+
+        return gguf.align_items(audio_path, text, language)
+    if backend == "auto" and _GGUF_FALLBACK_STATE.get("primary_used"):
+        # auto 模式且 GGUF 跑了主转写：CUDA DLL 已驻留，torch 对齐器加载会炸
+        # （cublas 同名冲突），对齐留在 GGUF 家族内
+        import subfix_qwen3_gguf as gguf
+
+        return gguf.align_items(audio_path, text, language)
     if backend not in DOUBAO_ASR_BACKENDS:
         return qwen3_force_align_items(audio_path, text, language)
     clean_text = str(text or "").strip()
@@ -5009,17 +5497,22 @@ def should_try_qwen_batch_backend(backend: str) -> bool:
 
 
 def qwen_generate_batch_size() -> int:
-    # 与库内推理批同源自适应（auto_inference_batch_size，实测校准见其注释）：
-    # 干净 8GB 卡取 2，显存被达芬奇等挤占时自动降到 1。喂入批只决定多少个
-    # 窗文件一次传给库，真正的 generate 批由库内 max_inference_batch_size 决定，
-    # 两者不一致不影响正确性。
+    # 喂入批跟实时显存走，不再用启动那一刻的快照。快照版本的实际后果：常驻服务
+    # 启动时达芬奇已经占着卡 → 快照 4.6GB → 一律返回 1，此后不管显存怎么回落都
+    # 一次只喂一个窗，库内的批 2 永远用不上（等于白留一档）。
+    # 喂入批放大后对齐阶段会一次吃下整批窗，这个风险由 transcribe_qwen3_asr_batch
+    # 里的"OOM 退成逐条对齐"兜住，所以这里可以放心跟实时读数。
+    # 读不到实时显存才回落到启动快照那套分档。
     raw_value = os.getenv("SUBFIX_QWEN_GENERATE_BATCH_SIZE")
     if raw_value:
         try:
             return max(1, int(raw_value))
         except ValueError:
             pass
-    return auto_inference_batch_size()
+    readings = _gpu_occupied_by_others_gb()
+    if readings is None:
+        return auto_inference_batch_size()
+    return pick_inference_batch_size(readings)
 
 
 def recover_v4_asr_window(
@@ -5919,6 +6412,19 @@ def try_script_direct_subtitles(
     }
 
 
+def report_proofread_degradation(progress_path: Path | None, diagnostic: dict[str, Any]) -> None:
+    """pypinyin 缺失时同音纠错做不了（文稿校对降级为标点修正），必须当场说出来。
+
+    识别环境里 pypinyin 是随 qwen-asr 一起装的可选依赖；缺了不能让用户以为
+    同音别字已经校过——进度一条 + 诊断留痕，管线其余部分照跑。
+    """
+    message = str(script_proofread.pinyin_missing_message() or "")
+    if not message:
+        return
+    diagnostic["proofread_unavailable_reason"] = message
+    write_progress(progress_path, "proofread_homophone_missing", message)
+
+
 def run_generate_subtitles_batch_plan_v4(
     batches: list[dict[str, Any]],
     args: argparse.Namespace,
@@ -6048,9 +6554,7 @@ def run_generate_subtitles_batch_plan_v4(
     active_mode_profile: dict[str, Any] | None = None
     v5_writeback = v5_writeback_mode() if v5_mode else "shadow"
     if v5_mode:
-        profile, profile_status = load_segmentation_profile_v5(
-            getattr(args, "segmentation_profile", None)
-        )
+        profile, profile_status = load_generation_profile(args, "v5")
         diagnostic["profile_load_status"] = profile_status
         if profile_status != "loaded":
             raise RuntimeError(f"v5 分句配置不可用（{profile_status}），请重新安装最新版 SubFix")
@@ -6120,7 +6624,7 @@ def run_generate_subtitles_batch_plan_v4(
         raw_payloads: list[dict[str, Any]] = []
         # Qwen3-ASR 模型在首窗口转写时才懒加载（约 1-2 分钟），期间进度停在 25%
         # 会被误认为卡死：这里提前预热模型，并用 indeterminate 进度明确告知加载中。
-        if not uses_doubao_backend:
+        if not uses_doubao_backend and not qwen3_gguf_auto_candidate():
             write_progress(
                 progress_path,
                 "加载模型",
@@ -6152,6 +6656,16 @@ def run_generate_subtitles_batch_plan_v4(
             except Exception:
                 pass
             raw_payloads.extend(chunk_payloads)
+            for source_payload in chunk_payloads:
+                record_generation_asr(args, source_payload)
+            if chunk_asr_diagnostic.get("gguf_fallback_error") and not diagnostic.get("gguf_fallback_error"):
+                diagnostic["gguf_fallback_error"] = chunk_asr_diagnostic["gguf_fallback_error"]
+                write_progress(
+                    progress_path,
+                    "gguf_fallback",
+                    "GGUF 快速引擎失败已回退 Qwen：" + str(chunk_asr_diagnostic["gguf_fallback_error"])[:120],
+                    indeterminate=True,
+                )
             diagnostic["asr_backend_used"] = chunk_asr_diagnostic.get(
                 "asr_backend_used", diagnostic["asr_backend_used"]
             )
@@ -6225,6 +6739,8 @@ def run_generate_subtitles_batch_plan_v4(
                 recovery_diagnostic.get("asr_subwindow_retry_count") or 0
             )
             recovered_payloads.append(recovered_payload)
+            if recovery not in {"not_needed", "accepted_silence", "accepted_doubao_empty_speech"}:
+                record_generation_asr(args, recovered_payload, "recovery")
             recovery_diagnostics.append(recovery_diagnostic)
         raw_payloads = recovered_payloads
         retry_regions: list[dict[str, Any]] = []
@@ -6261,6 +6777,7 @@ def run_generate_subtitles_batch_plan_v4(
                     float(track["fps"]),
                 )
                 retry_payload = retry_transcribe_fn(retry_path, args.model, args.language)
+                record_generation_asr(args, retry_payload, "retry_candidate")
                 diagnostic["local_retry_elapsed_seconds"] += time.monotonic() - local_retry_started_at
                 write_progress(
                     progress_path,
@@ -6560,6 +7077,7 @@ def run_generate_subtitles_batch_plan_v4(
                 )
                 try:
                     retry_payload = retry_transcribe_fn(retry_path, args.model, args.language)
+                    record_generation_asr(args, retry_payload, "retry_candidate")
                     retry_units, retry_align_diagnostic = generate_v4.require_aligned_units(
                         retry_path,
                         retry_payload,
@@ -6795,6 +7313,7 @@ def run_generate_subtitles_batch_plan_v4(
                 subtitle_rows, script_text
             )
             diagnostic.update(proofread_diagnostic)
+            report_proofread_degradation(progress_path, diagnostic)
         subtitle_rows, hard_char_split_count = generate_v4.enforce_hard_char_limit(
             subtitle_rows,
             canonical_units,
@@ -7252,7 +7771,16 @@ def qwen3_cpp_forced_align_text_rows(
         "-o",
         str(output_path),
     ]
-    result = subprocess.run(cmd, text=True, capture_output=True, creationflags=CREATE_NO_WINDOW)
+    try:
+        result = subprocess.run(
+            cmd, text=True, capture_output=True,
+            creationflags=CREATE_NO_WINDOW, timeout=QWEN3_CPP_ALIGN_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Qwen3 forced align 超过 {QWEN3_CPP_ALIGN_TIMEOUT_SECONDS:.0f} 秒仍未返回，已终止："
+            "显存可能吃紧或对齐文本过长，请缩短选区后重试，或改用 CTC 对齐"
+        ) from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"Qwen3 forced align 执行失败: {detail or result.returncode}")
@@ -7677,12 +8205,27 @@ def _serve_ready_dir() -> Path:
     return Path(tempfile.gettempdir())
 
 
+# 转发请求的等待上限，必须长于最长任务。
+#
+# 旧值 3600 秒（1 小时）比真实任务短：39 分钟素材在显存溢出时实测跑了 89 分钟。
+# 客户端 1 小时就 socket.timeout，try_serve_relay 把"我没等到回音"误判成
+# "serve 没接活"，于是回退到自己加载第二份模型执行——而 serve 那边仍在跑同一个
+# 请求。两份 6.4GB 模型同时驻留，全员掉进 sysmem fallback：那一跑 89 分钟里，
+# 00:11~00:36 这 25 分钟纯属两份模型互相踩（后段 235 秒/窗，单任务时只要 11.6 秒）。
+_SERVE_REQUEST_TIMEOUT_SECONDS = 12 * 3600.0
+
+
 def _serve_request(argv: list[str], host: str, port: int, connect_timeout: float = 5.0) -> bool:
-    """向 serve 实例转发一次请求；连不上/超时返回 False（调用方回退）。"""
+    """向 serve 实例转发一次请求；连不上返回 False（调用方回退）。
+
+    注意超时只用于"等到一个结果"，不代表 serve 没在干活：serve 是同步跑
+    main()，整段转录期间一个字节都不往外发。所以超时值见
+    _SERVE_REQUEST_TIMEOUT_SECONDS，绝不能按"觉得该跑完了"来定。
+    """
     import socket
 
     with socket.create_connection((host, port), timeout=connect_timeout) as conn:
-        conn.settimeout(3600.0)  # 转录按分钟计；取消由调用方杀进程树承担
+        conn.settimeout(_SERVE_REQUEST_TIMEOUT_SECONDS)  # 取消由调用方杀进程树承担
         conn.sendall((json.dumps({"argv": argv}) + "\n").encode("utf-8"))
         buffer = b""
         while b"\n" not in buffer:
@@ -7775,6 +8318,11 @@ def try_serve_relay(argv: list[str]) -> bool:
     30 秒请求拖到 21 分钟）：
     - 已有就绪文件 → 只排队转发（serve 串行处理，忙时等待），绝不冷启动；
     - 无就绪文件   → 拉起 detached 实例，等就绪后转发，超时才回退普通流程。
+
+    ⚠ "超时才回退"是这里最危险的一条：serve 同步跑 main()，整段转录期间不往
+    连接上发任何字节，客户端只能干等。等不到不等于没在干活——此时回退自己执行
+    就是两份模型同时驻留。所以等待超时后必须先确认 serve 是否还活着：活着就报错
+    退出，交给用户处理，绝不自行并发。
     """
     import glob
     import socket
@@ -7782,7 +8330,7 @@ def try_serve_relay(argv: list[str]) -> bool:
     ready_paths = _live_serve_ready_paths()
     if ready_paths:
         # serve 在忙上一个请求时 accept/响应都可能慢：给足排队时间，不回退
-        deadline = time.monotonic() + 3600.0
+        deadline = time.monotonic() + _SERVE_REQUEST_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             ready_paths = _live_serve_ready_paths()
             if not ready_paths:
@@ -7792,13 +8340,27 @@ def try_serve_relay(argv: list[str]) -> bool:
                     info = json.loads(Path(info_path).read_text(encoding="utf-8"))
                     if _serve_request(argv, "127.0.0.1", int(info["port"])):
                         return True
-                except (OSError, ValueError, RuntimeError):
+                except RuntimeError:
+                    # serve 明确回了 ok=False（转录本身失败）：重试也是同一个结果，
+                    # 直接向上抛，别把它当成网络抖动吞掉再空等 12 小时
+                    raise
+                except (OSError, ValueError):
                     pass
             time.sleep(2.0)
+        # 走到这里说明等到超时。serve 若仍活着，它极可能正在跑本次请求：
+        # 此刻回退 = 第二份 6.4GB 模型，正是 235 秒/窗 的来源。
+        if _live_serve_ready_paths():
+            raise RuntimeError(
+                "常驻服务仍在处理本次请求（等待已超时）。为避免两份模型同时驻留"
+                "把显存挤爆，这里不再回退执行；请等它完成，或结束 serve 进程后重试。"
+            )
         return False
 
     _spawn_serve_process()
-    deadline = time.monotonic() + float(os.getenv("SUBFIX_SERVE_SPAWN_TIMEOUT") or "240")  # 覆盖冷启动 import torch + 双模型加载
+    # 冷启动要 import torch + 加载双模型，240 秒在慢盘/冷缓存下不够。超时的后果
+    # 不是"再等一会"，而是回退自己执行——而 serve 正在后台加载同一批权重，又是
+    # 两份模型。这里放宽到 900 秒，宁可多等也不要并发。
+    deadline = time.monotonic() + float(os.getenv("SUBFIX_SERVE_SPAWN_TIMEOUT") or "900")
     while time.monotonic() < deadline:
         time.sleep(1.0)
         for info_path in sorted(glob.glob(str(_serve_ready_dir() / SUBFIX_SERVE_READY_GLOB))):
@@ -7806,7 +8368,9 @@ def try_serve_relay(argv: list[str]) -> bool:
                 info = json.loads(Path(info_path).read_text(encoding="utf-8"))
                 if _serve_request(argv, "127.0.0.1", int(info["port"])):
                     return True
-            except (OSError, ValueError, RuntimeError):
+            except RuntimeError:
+                raise
+            except (OSError, ValueError):
                 continue
     return False
 
@@ -7820,11 +8384,17 @@ def run_serve_server(port: int = SUBFIX_SERVE_PORT_BASE, idle_timeout: float = 1
     """
     import socket
 
-    # 预热：吸收 import torch + 双模型加载；失败不退出，首个请求时再暴露具体错误
+    # 预热：吸收 import torch + 双模型加载；失败不退出，首个请求时再暴露具体错误。
+    # GGUF 后端可用时跳过 torch 双模型预热（GGUF 引擎在首个请求懒加载，约 3 秒）
     warm_error = None
     try:
-        load_qwen3_asr_model(os.getenv("SUBFIX_QWEN3_ASR_MODEL") or QWEN3_ASR_MODEL)
-        load_qwen3_forced_aligner()
+        if not qwen3_gguf_auto_candidate():
+            load_qwen3_asr_model(os.getenv("SUBFIX_QWEN3_ASR_MODEL") or QWEN3_ASR_MODEL)
+            load_qwen3_forced_aligner()
+        else:
+            import subfix_qwen3_gguf as _gguf
+
+            _gguf.get_engine()
     except Exception as exc:
         warm_error = str(exc)[:300]
 
@@ -7876,7 +8446,11 @@ def run_serve_server(port: int = SUBFIX_SERVE_PORT_BASE, idle_timeout: float = 1
                 except SystemExit as exc:
                     response = {"ok": int(exc.code or 0) == 0}
                 except Exception as exc:
-                    response = {"ok": False, "error": str(exc)[:400]}
+                    # 非 0 退出码会走 SystemExit 之外的自定义返回路径，错误细节只有
+                    # stdout 里的 str(exc) 一行；这里把完整堆栈也打进 serve 日志
+                    import traceback as _tb
+                    _tb.print_exc()
+                    response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:400]}
                 last_activity = time.monotonic()
             except (OSError, ValueError) as exc:
                 response = {"ok": False, "error": f"请求解析失败: {exc}"[:200]}
@@ -7894,6 +8468,14 @@ def run_serve_server(port: int = SUBFIX_SERVE_PORT_BASE, idle_timeout: float = 1
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    # 常驻服务里 main 每个请求跑一遍：阶段计时与环境上下文按请求重置，否则第二个
+    # 请求的 elapsed_seconds 会带着上一个请求的陈旧读数（进程可能已经活了半小时）。
+    global _PROGRESS_CONTEXT
+    _PROGRESS_CONTEXT = None
+    _PROGRESS_STAGE_TIMES.clear()
+    # 批大小决策与显存读数每请求重播一次，陈旧决策不许带进下一轮
+    _AUTO_BATCH_STATE.pop("batch_reported", None)
+    _AUTO_BATCH_STATE.pop("batch_decision", None)
     # 常驻服务转发：--via-serve 在 argparse 之前摘除。serve 可达则由它执行完整
     # 管线（模型常驻，产物照旧落盘）；不可达则拉起 serve 重试一次，仍失败就地
     # 继续普通流程——调用方（Lua）除多传一个标志外零感知。
@@ -7933,6 +8515,7 @@ def main(argv: list[str] | None = None) -> int:
         "--backend",
         choices=(
             "auto",
+            "qwen3_gguf",
             "mimo_asr",
             "qwen3_asr",
             "mlx_whisper",
@@ -7959,6 +8542,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fixture-json")
     parser.add_argument("--progress-json")
     parser.add_argument("--diagnostic-output")
+    parser.add_argument("--plugin-source", help="运行中的 SubFix.lua，仅用于本地版本指纹")
+    parser.add_argument("--generation-core-source", help="运行中的生成模块，仅用于本地指纹")
     parser.add_argument(
         "--script-file",
         help=(
@@ -7985,6 +8570,9 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    # 仅生成模式起记录：识别文本/时序/批处理一律不受影响，只多一层元数据。
+    if args.mode in {"generate_subtitles", "generate_subtitles_batch"}:
+        args.generation_trace = start_generation_trace(args)
 
     if args.mode not in {"serve", "prewarm"} and not args.output:
         parser.error("--output is required unless --mode serve/prewarm")
@@ -8062,12 +8650,9 @@ def main(argv: list[str] | None = None) -> int:
                     args.fps,
                     srt_base_frame,
                 )
+            finish_generation_trace(args, payload)
+            write_generation_diagnostic(args, payload)
             write_payload(output_path, build_generate_writeback_payload(payload))
-            if args.diagnostic_output:
-                write_payload(
-                    Path(args.diagnostic_output).expanduser(),
-                    sanitize_generate_diagnostic_payload(payload),
-                )
             completion_index, completion_total = generate_helper_completion_progress(
                 payload.get("diagnostic", {})
             )
@@ -8361,24 +8946,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except Exception as exc:
         write_progress(progress_path, "failed", str(exc))
-        write_payload(output_path, {"ok": False, "error": str(exc), "segments": []})
+        failure_payload = {"ok": False, "error": str(exc), "segments": []}
+        finish_generation_trace(args, failure_payload)
+        write_payload(output_path, failure_payload)
         if args.mode in {"generate_subtitles", "generate_subtitles_batch"} and args.diagnostic_output:
             failure_code = "generate_failed"
             if args.generate_engine in {"v4", "v5"} and isinstance(exc, generate_v4.V4AlignmentError):
                 failure_code = f"{args.generate_engine}_alignment_failed"
-            write_payload(
-                Path(args.diagnostic_output).expanduser(),
-                sanitize_generate_diagnostic_payload(
-                    {
-                        "ok": False,
-                        "diagnostic": {
-                            "subtitle_mode": args.subtitle_mode,
-                            "generate_engine": args.generate_engine,
-                            "failure_code": failure_code,
-                        },
-                        "subtitle_rows": [],
-                    }
-                ),
+            write_generation_diagnostic(
+                args,
+                {
+                    "ok": False,
+                    **({"generation_trace": failure_payload["generation_trace"]} if "generation_trace" in failure_payload else {}),
+                    "diagnostic": {
+                        "subtitle_mode": args.subtitle_mode,
+                        "generate_engine": args.generate_engine,
+                        "failure_code": failure_code,
+                    },
+                    "subtitle_rows": [],
+                },
             )
         print(str(exc), file=sys.stderr)
         return 1

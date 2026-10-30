@@ -23,6 +23,7 @@ PLUGIN_LUA = ["SubFix.lua", "生成选区字幕.lua", "文稿匹配.lua"]
 # 安装布局里所有 python 助手都进 .subfix_support/；其中 4 个在开发树位于仓库根目录
 ROOT_PY = [
     "subfix_asr_transcribe.py",
+    "subfix_qwen3_gguf.py",
     "subfix_generate_v4.py",
     "subfix_generate_v5.py",
     "subfix_generate_textnorm.py",
@@ -72,6 +73,19 @@ def build_stage(version: str, bundle_runtime: bool, qwen_cpp: Path | None = None
         src = ROOT / ".subfix_support" / name
         if src.exists():
             shutil.copy2(src, support_dir / name)
+    gguf_pkg_src = ROOT / "qwen_asr_gguf"
+    if gguf_pkg_src.is_dir():
+        # inference/bin 是 CUDA 那套（cublasLt 452MB + ggml-cuda 424MB + cublas 95MB），
+        # bin-vulkan 是 Vulkan（61MB，大头 ggml-vulkan.dll 53MB）。轻量包两个都不带：
+        # 运行时与权重一样走外部目录（models/qwen3-asr-gguf-runtime 或 SUBFIX_QWEN3_GGUF_BIN），
+        # 缺了 subfix_qwen3_gguf 会报中文原因并回退 torch，不会假装加速还在。
+        # 要发带 CUDA 的 Max 包走 --qwen-cpp，那条路自己拷 bin。
+        shutil.copytree(
+            gguf_pkg_src, support_dir / "qwen_asr_gguf",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "bin", "bin-vulkan"),
+        )
+    else:
+        print("警告：缺少 qwen_asr_gguf 引擎包，本包不含 qwen3_gguf 加速后端")
     missing = [n for n in ROOT_PY if not (support_dir / n).exists()]
     if missing:
         shutil.rmtree(stage, ignore_errors=True)

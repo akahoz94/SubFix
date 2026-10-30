@@ -64,6 +64,7 @@ if SUBFIX_IS_WINDOWS then
             int CreateProcessW(const wchar_t *lpApplicationName, wchar_t *lpCommandLine, void *lpProcessAttributes, void *lpThreadAttributes, int bInheritHandles, unsigned long dwCreationFlags, void *lpEnvironment, const wchar_t *lpCurrentDirectory, void *lpStartupInfo, void *lpProcessInformation);
             int WaitForSingleObject(void *hHandle, unsigned long dwMilliseconds);
             int GetExitCodeProcess(void *hProcess, unsigned long *lpExitCode);
+            void *OpenProcess(unsigned long dwDesiredAccess, int bInheritHandle, unsigned long dwProcessId);
             typedef struct { DWORD cb; wchar_t *lpReserved; wchar_t *lpDesktop; wchar_t *lpTitle; DWORD dwX; DWORD dwY; DWORD dwXSize; DWORD dwYSize; DWORD dwXCountChars; DWORD dwYCountChars; DWORD dwFillAttribute; DWORD dwFlags; unsigned short wShowWindow; unsigned short cbReserved2; unsigned char *lpReserved2; void *hStdInput; void *hStdOutput; void *hStdError; } STARTUPINFOW;
             typedef struct { void *hProcess; void *hThread; DWORD dwProcessId; DWORD dwThreadId; } PROCESS_INFORMATION;
             int GetSystemMetrics(int nIndex);
@@ -157,6 +158,20 @@ if SUBFIX_IS_WINDOWS then
 
         -- 以 UTF-8 命令行启动分离进程，返回 PID（失败 nil）。
         -- 用于后台批处理：绕开 system() 的 ANSI 命令行限制，并直接获得 cmd.exe PID。
+        -- 进程是否还活着：PROCESS_QUERY_LIMITED_INFORMATION(0x1000) + STILL_ACTIVE(259)。
+        -- 用在"helper 崩了但没写完成标记"的判活上，进度窗才不至于干等。
+        function subfix_process_alive(pid)
+            pid = tonumber(pid)
+            if not pid or pid <= 0 then return nil end
+            local h = SUBFIX_FFI.C.OpenProcess(0x1000, 0, pid)
+            if h == nil then return false end
+            local code = SUBFIX_FFI.new("DWORD[1]")
+            local ok = SUBFIX_FFI.C.GetExitCodeProcess(h, code)
+            SUBFIX_FFI.C.CloseHandle(h)
+            if ok == 0 then return false end
+            return code[0] == 259
+        end
+
         function subfix_start_process_w(utf8_command)
             local wcmd = subfix_utf8_to_wide(utf8_command)
             if not wcmd then return nil end
@@ -692,8 +707,15 @@ local function resolve_asr_paths()
         python = helper_dir .. venv_python_rel,
         runtime_python = helper_dir .. runtime_python_rel,
         diagnostic = user_support_dir .. "/last_generate_diagnostic.json",
+        generation_history = user_support_dir .. "/generation_history",
+        plugin_source = root .. "/SubFix.lua",
+        generation_core_source = script_dir() .. "/subfix_generate_selection_core.lua",
         hotwords = user_support_dir .. "/hotwords.json"
     }
+    -- 装机布局是 Utility\SubFix\SubFix.lua（入口脚本靠父级 .subfix_support 回退，root 就成了 Utility）
+    if not file_exists(paths.plugin_source) and file_exists(root .. "/SubFix/SubFix.lua") then
+        paths.plugin_source = root .. "/SubFix/SubFix.lua"
+    end
     if not file_exists(paths.helper) and file_exists(root .. "/subfix_asr_transcribe.py") then
         paths.helper = root .. "/subfix_asr_transcribe.py"
         paths.qwen_manager = root .. "/subfix_qwen_local_manager.py"
@@ -878,21 +900,42 @@ local function write_generate_preferences(data)
     -- 本机模型登记（"使用本机模型"选项写入），随偏好持久化，避免每次生成都弹窗
     local local_asr_model = trim_text(tostring(data.local_asr_model or ""))
     local local_aligner_model = trim_text(tostring(data.local_aligner_model or ""))
+    local selected_audio_tracks = {}
+    for _, track_index in ipairs(type(data.selected_audio_tracks) == "table" and data.selected_audio_tracks or {}) do
+        if type(track_index) == "number" and track_index > 0 and track_index % 1 == 0 then
+            selected_audio_tracks[#selected_audio_tracks + 1] = tostring(track_index)
+        end
+    end
+    local audio_track_count = tonumber(data.audio_track_count)
+    if not audio_track_count or audio_track_count < 1 or audio_track_count % 1 ~= 0 then
+        audio_track_count = nil
+    end
     local content = string.format(
-        '{\n  "last_engine_backend": "%s",\n  "doubao_backend": "%s",\n  "local_asr_model": "%s",\n  "local_aligner_model": "%s"\n}\n',
+        '{\n  "last_engine_backend": "%s",\n  "doubao_backend": "%s",\n  "qwen_flavor": "%s",\n  "local_asr_model": "%s",\n  "local_aligner_model": "%s",\n  "max_chars": %d,\n  "hotwords_enabled": %s,\n  "audio_track_count": %s,\n  "selected_audio_tracks": [%s]\n}\n',
         json_escape(last_engine_backend),
         json_escape(doubao_backend),
+        json_escape((trim_text(tostring(data.qwen_flavor or "")) == "exact") and "exact" or "fast"),
         json_escape(local_asr_model),
-        json_escape(local_aligner_model)
+        json_escape(local_aligner_model),
+        tonumber(data.max_chars) == 10 and 10 or 25,
+        type(data.hotwords_enabled) == "boolean" and tostring(data.hotwords_enabled) or "null",
+        audio_track_count and tostring(audio_track_count) or "null",
+        table.concat(selected_audio_tracks, ",")
     )
     return write_text_file(generate_prefs_file_path(), content)
 end
 
--- 记住本次选择的识别模型 backend，同时固化旧偏好中的豆包版本。
-local function save_last_engine_backend(backend)
+-- 生成时一并保存长度/热词/轨道选择；仅切换模型时保留已有选择。
+local function save_last_engine_backend(backend, max_chars, hotwords_enabled, audio_track_count, selected_audio_tracks)
     local data = read_generate_preferences()
     data.doubao_backend = read_doubao_backend_preference()
     data.last_engine_backend = backend
+    if max_chars ~= nil then data.max_chars = max_chars end
+    if type(hotwords_enabled) == "boolean" then data.hotwords_enabled = hotwords_enabled end
+    if audio_track_count ~= nil and type(selected_audio_tracks) == "table" then
+        data.audio_track_count = audio_track_count
+        data.selected_audio_tracks = selected_audio_tracks
+    end
     return write_generate_preferences(data)
 end
 
@@ -1504,17 +1547,20 @@ local function read_generation_scope(timeline, fps)
     return nil, (scope_err or "请先用 I/O 设置 In/Out 选区") .. "；灰色时间线选择或鼠标选中片段 Resolve 脚本 API 读不到"
 end
 
-local function get_audio_item_source_offset_frames(item)
+local function get_audio_item_source_offset_frames(item, timeline_fps)
     local ok_source_start, source_start_frames = pcall(function() return item:GetSourceStartFrame() end)
     local offset = ok_source_start and tonumber(source_start_frames) or nil
-    if offset and offset >= 0 then return offset end
+    local ok_source_fps, source_fps = pcall(function() return item:GetMediaPoolItem():GetClipProperty("FPS") end)
+    source_fps = ok_source_fps and tonumber(source_fps) or nil
+    -- GetSourceStartFrame 给的是素材帧，GetLeftOffset 给的是时间线帧；两者必须配各自的帧率换算。
+    if offset and offset >= 0 and source_fps and source_fps > 0 then return offset, source_fps end
     local ok_left_offset, left_offset_frames = pcall(function() return item:GetLeftOffset(false) end)
     if not ok_left_offset then
         ok_left_offset, left_offset_frames = pcall(function() return item:GetLeftOffset() end)
     end
     offset = ok_left_offset and tonumber(left_offset_frames) or 0
-    if not offset or offset < 0 then return 0 end
-    return offset
+    if not offset or offset < 0 then offset = 0 end
+    return offset, timeline_fps
 end
 
 local function get_audio_item_file_path(item)
@@ -1746,12 +1792,12 @@ local function collect_audio_sources_for_scope(timeline, scope, fps)
                 if overlap_frames > 0 then
                     local file_path = get_audio_item_file_path(item)
                     if file_path then
-                        local source_offset_frames = get_audio_item_source_offset_frames(item)
+                        local source_offset_frames, source_offset_fps = get_audio_item_source_offset_frames(item, effective_fps)
                         local ok_media, media_item = pcall(function() return item:GetMediaPoolItem() end)
                         media_item = ok_media and media_item or nil
-                        local mapped_audio = parse_source_audio_channel_mapping(item, media_item, effective_fps, source_offset_frames, file_path)
+                        local mapped_audio = parse_source_audio_channel_mapping(item, media_item, source_offset_fps, source_offset_frames, file_path)
                         file_path = mapped_audio.file_path or file_path
-                        local item_source_start_seconds = tonumber(mapped_audio.source_start_seconds) or (source_offset_frames / effective_fps)
+                        local item_source_start_seconds = tonumber(mapped_audio.source_start_seconds) or (source_offset_frames / source_offset_fps)
                         local source_start_seconds = item_source_start_seconds + ((overlap_start - item_start) / effective_fps)
                         local source_end_seconds = source_start_seconds + (overlap_frames / effective_fps)
                         local candidate = {
@@ -1793,6 +1839,11 @@ local function collect_audio_sources_for_scope(timeline, scope, fps)
         return nil, "未找到与选区重叠的本地音频片段"
     end
     return audio_sources
+end
+
+-- 只给测试用（tests/test_source_fps_timing.py），别按可达性判死。
+function SubFixGenerateSelectionCore.collect_audio_sources_for_scope(timeline, scope, fps)
+    return collect_audio_sources_for_scope(timeline, scope, fps)
 end
 
 local function build_audio_track_options_for_dialog(audio_sources)
@@ -2239,7 +2290,7 @@ local function parse_generated_json_subtitle_rows(json_path)
         end
     end
     if #rows == 0 then return nil, "生成 JSON 没有可写回字幕" end
-    return rows
+    return rows, nil, payload.generation_trace
 end
 
 local function subtract_existing_ranges(row, accepted_ranges)
@@ -2408,7 +2459,14 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local SUBTITLE_LENGTH_SELECTED_PREFIX = TRACK_CHECKED_MARK .. " "
     local SUBTITLE_LENGTH_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
     local selected_length_index = 1
-    local selected_max_chars = SUBTITLE_LENGTH_OPTIONS[1].max_chars
+    local generate_preferences = read_generate_preferences()
+    for index, option in ipairs(SUBTITLE_LENGTH_OPTIONS) do
+        if option.max_chars == tonumber(generate_preferences.max_chars) then
+            selected_length_index = index
+            break
+        end
+    end
+    local selected_max_chars = SUBTITLE_LENGTH_OPTIONS[selected_length_index].max_chars
     -- 识别模型：主面板只保留 Qwen（本地）与豆包（云端）两个入口；豆包具体版本
     -- 在配置窗口内选择，并通过 selected_doubao_backend 映射到实际 helper backend。
     -- 仅决定把哪个 --backend 传给 ASR helper，不改断句/回声/对齐算法本体。默认
@@ -2435,8 +2493,25 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         end
     end
     local selected_backend = SUBTITLE_ENGINE_OPTIONS[selected_engine_index].backend
+    -- Qwen 引擎档位：快速（GGUF 量化，约快 2-3 倍，方言/嘈杂现场有少量识别差异）
+    -- / 精准（原版 bf16）。仅影响 Qwen（本地）时传给 helper 的 --backend：
+    -- 快速=auto（GGUF 可用则用，缺环境自动回退原版），精准=显式 qwen3_asr。
+    local QWEN_FLAVOR_FAST, QWEN_FLAVOR_EXACT = "fast", "exact"
+    local selected_qwen_flavor = "fast"
+    do
+        local prefs = read_generate_preferences()
+        local stored = trim_text(tostring(prefs.qwen_flavor or ""))
+        if stored == QWEN_FLAVOR_EXACT then selected_qwen_flavor = QWEN_FLAVOR_EXACT end
+        if last_engine_backend == "qwen3_asr" then
+            selected_engine_index = 1
+            selected_qwen_flavor = QWEN_FLAVOR_EXACT
+        end
+    end
     local hotword_entries = load_generate_hotword_entries()
     local hotwords_enabled = #hotword_entries > 0
+    if type(generate_preferences.hotwords_enabled) == "boolean" then
+        hotwords_enabled = hotwords_enabled and generate_preferences.hotwords_enabled
+    end
     local selected_hotwords_json = nil
     local dialog_cancelled = false
     local qwen_install_requested = false
@@ -2470,6 +2545,14 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             ui:Label{Text = "识别模型：", Weight = 0},
             ui:Button{ID = "GenerateSubtitleEngineQwenBtn", Text = "Qwen（本地）", Weight = 0, MinimumSize = {0, 20}},
             ui:Button{ID = "GenerateSubtitleEngineDoubaoBtn", Text = "豆包（云端）", Weight = 0, MinimumSize = {0, 20}},
+            ui:HGap(0, 1)
+        },
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:Label{Text = "Qwen 引擎：", Weight = 0},
+            ui:Button{ID = "GenerateQwenFlavorFastBtn", Text = "快速（量化）", Weight = 0, MinimumSize = {0, 20}},
+            ui:Button{ID = "GenerateQwenFlavorExactBtn", Text = "精准（原版）", Weight = 0, MinimumSize = {0, 20}},
             ui:HGap(0, 1)
         },
         ui:HGroup{
@@ -2539,6 +2622,8 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     local engine_qwen_btn = items and items.GenerateSubtitleEngineQwenBtn or nil
     local engine_doubao_btn = items and items.GenerateSubtitleEngineDoubaoBtn or nil
+    local qwen_flavor_fast_btn = items and items.GenerateQwenFlavorFastBtn or nil
+    local qwen_flavor_exact_btn = items and items.GenerateQwenFlavorExactBtn or nil
     local hotword_toggle_btn = items and items.GenerateHotwordToggleBtn or nil
 
     local function refresh_subtitle_engine_buttons()
@@ -2557,11 +2642,31 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         refresh_subtitle_engine_buttons()
     end
 
+    local function refresh_qwen_flavor_buttons()
+        if qwen_flavor_fast_btn then
+            local prefix = selected_qwen_flavor == "fast" and SUBTITLE_ENGINE_SELECTED_PREFIX or SUBTITLE_ENGINE_UNSELECTED_PREFIX
+            pcall(function() qwen_flavor_fast_btn.Text = prefix .. "快速（量化）" end)
+        end
+        if qwen_flavor_exact_btn then
+            local prefix = selected_qwen_flavor == "exact" and SUBTITLE_ENGINE_SELECTED_PREFIX or SUBTITLE_ENGINE_UNSELECTED_PREFIX
+            pcall(function() qwen_flavor_exact_btn.Text = prefix .. "精准（原版）" end)
+        end
+    end
+
+    local function select_qwen_flavor(flavor)
+        selected_qwen_flavor = flavor
+        refresh_qwen_flavor_buttons()
+    end
+
     refresh_subtitle_engine_buttons()
+    refresh_qwen_flavor_buttons()
 
     local function read_selected_backend()
         if selected_engine_index == 2 then
             return selected_doubao_backend
+        end
+        if selected_qwen_flavor == "exact" then
+            return "qwen3_asr"
         end
         return "auto"
     end
@@ -3032,11 +3137,26 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local last_qwen_click_time = nil
     local doubao_reminder_shown = false
 
+    -- 轨道数量一致时按轨道编号恢复，避免把勾选套到不同的列表行上。
+    local restored_tracks, has_restored_track = {}, false
+    if generate_preferences.audio_track_count == #audio_sources
+        and type(generate_preferences.selected_audio_tracks) == "table" then
+        for _, track_index in ipairs(generate_preferences.selected_audio_tracks) do
+            if type(track_index) == "number" and track_index > 0 and track_index % 1 == 0 then
+                restored_tracks[track_index] = true
+            end
+        end
+        for _, source in ipairs(audio_sources) do
+            if restored_tracks[source.track_index] then has_restored_track = true end
+        end
+    end
+
     local item_map = {}
     for index, source in ipairs(audio_sources) do
         local ok_item, item = pcall(function() return track_tree:NewItem() end)
         if ok_item and item then
             local checked = index == 1
+            if has_restored_track then checked = restored_tracks[source.track_index] == true end
             track_rows[index] = {source = source, checked = checked, item = item}
             set_tree_item_text(item, 0, checked and TRACK_CHECKED_MARK or TRACK_UNCHECKED_MARK)
             set_tree_item_text(item, 1, format_audio_source_label(source, fps))
@@ -3071,6 +3191,15 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             set_track_checked(track_rows[row_index], not track_rows[row_index].checked)
             safe_refresh_tree_widget(track_tree)
         end
+    end
+
+    -- Qwen 引擎档位：快速（量化）/ 精准（原版），仅对 Qwen（本地）生效
+    function selection_window.On.GenerateQwenFlavorFastBtn.Clicked(ev)
+        select_qwen_flavor("fast")
+    end
+
+    function selection_window.On.GenerateQwenFlavorExactBtn.Clicked(ev)
+        select_qwen_flavor("exact")
     end
 
     -- 字幕长度：两个互斥按钮，点击即切换选中项并高亮当前选择
@@ -3123,15 +3252,20 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         selected_max_chars = read_selected_max_chars()
         selected_backend = read_selected_backend()
         selected_hotwords_json = hotwords_enabled and resolve_asr_paths().hotwords or nil
-        if selected_backend == "auto" then
+        if selected_backend == "auto" or selected_backend == "qwen3_asr" then
             local qwen_status = inspect_local_qwen(resolve_asr_paths())
             if not qwen_status.ready then
                 open_qwen_download_dialog()
                 return
             end
         end
-        -- 记住本次识别模型，下次对话框默认选它。
-        save_last_engine_backend(selected_backend)
+        -- 记住本次生成选项（模型/长度/热词/轨道），下次打开对话框时恢复。
+        local selected_audio_tracks = {}
+        for _, source in ipairs(selected_audio_sources) do
+            selected_audio_tracks[#selected_audio_tracks + 1] = source.track_index
+        end
+        save_last_engine_backend(selected_backend, selected_max_chars, hotwords_enabled,
+            #audio_sources, selected_audio_tracks)
         pcall(function() selection_window:Hide() end)
         pcall(function() dispatcher:ExitLoop() end)
     end
@@ -3748,6 +3882,13 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
         "--progress-json", shell_quote(progress_path)
     }
     for _, value in ipairs(helper_args) do command_args[#command_args + 1] = value end
+    -- 源指纹参数：仅当本地真找到该文件才传，缺失就不传（Python 侧容忍缺省，未知选项会直接让生成立刻失败）。
+    if paths.plugin_source and file_exists(paths.plugin_source) then
+        for _, value in ipairs({"--plugin-source", shell_quote(paths.plugin_source)}) do command_args[#command_args + 1] = value end
+    end
+    if paths.generation_core_source and file_exists(paths.generation_core_source) then
+        for _, value in ipairs({"--generation-core-source", shell_quote(paths.generation_core_source)}) do command_args[#command_args + 1] = value end
+    end
     for _, value in ipairs(command_args) do cmd_parts[#cmd_parts + 1] = value end
     max_chars = tonumber(max_chars) or 25
     cmd_parts[#cmd_parts + 1] = "--max-chars"
@@ -3866,6 +4007,28 @@ local function run_background_command_with_progress(cmd, progress_path, progress
     local last_signature = nil
     local last_progress_changed_at = os.time()
     local stall_warning_logged = false
+    local started_at = os.time()
+    local last_process_check_at = started_at
+    local last_exit_check_at = started_at
+    local missing_process_checks = 0
+    local failed_at = nil
+    local terminal_error = nil
+
+    local function stop_polling()
+        pcall(function() poll_timer:Stop() end)
+        ui_timer_handlers[timer_id] = nil
+        pcall(function() dispatcher:ExitLoop() end)
+    end
+
+    local function asr_process_is_alive(pid)
+        if SUBFIX_IS_WINDOWS then
+            -- 没有 FFI（老宿主）就查不了活，交给 done/exit 文件判定
+            if not SUBFIX_WIN_FFI then return nil end
+            return subfix_process_alive(pid)
+        end
+        local alive = os.execute("kill -0 " .. tostring(pid) .. " 2>/dev/null")
+        return alive == true or alive == 0
+    end
 
     local timer_registered = register_ui_timer(poll_timer, function()
         local payload = parse_progress_payload(read_text_file(progress_path) or "")
@@ -3878,6 +4041,11 @@ local function run_background_command_with_progress(cmd, progress_path, progress
 
         local display_message = tostring(payload and payload.message or "正在识别音频...")
         local stalled_seconds = math.max(0, os.time() - last_progress_changed_at)
+        -- 阶段消息是一次性写入的（payload 里的 elapsed_seconds 进阶段时必为 0），
+        -- 所以"卡在哪一步"有了之后，"在这一步待了多久"由界面自己报，别让人猜。
+        if stalled_seconds >= 10 and stalled_seconds < GENERATE_PROGRESS_STALL_WARNING_SECONDS then
+            display_message = display_message .. string.format(" · 本阶段 %ds", stalled_seconds)
+        end
         if not (payload and payload.indeterminate) and stalled_seconds >= GENERATE_PROGRESS_STALL_WARNING_SECONDS then
             display_message = display_message .. " · 长时间无新进度，可取消后重试"
             if not stall_warning_logged then
@@ -3897,16 +4065,47 @@ local function run_background_command_with_progress(cmd, progress_path, progress
         if progress_state and progress_state.cancel_requested then
             cancelled = true
             kill_background_process(pid_file)
-            pcall(function() poll_timer:Stop() end)
-            ui_timer_handlers[timer_id] = nil
-            pcall(function() dispatcher:ExitLoop() end)
+            stop_polling()
             return
         end
 
-        if file_exists(done_file) then
-            pcall(function() poll_timer:Stop() end)
-            ui_timer_handlers[timer_id] = nil
-            pcall(function() dispatcher:ExitLoop() end)
+        -- 退出码落盘同样算终止：helper 崩了不写 done 文件时，进度窗不能再干等。
+        -- 轮询每 200ms 一跳，exit_file 每跳都读就是在 UI 线程上多开一次磁盘；
+        -- 批处理写完 exit_file 紧接着写 done_file，所以退出码 1 秒查一次就够。
+        local finished = file_exists(done_file)
+        if not finished and os.time() - last_exit_check_at >= 1 then
+            last_exit_check_at = os.time()
+            finished = tonumber(trim_text(read_text_file(exit_file) or "")) ~= nil
+        end
+        if finished then
+            stop_polling()
+            return
+        end
+        if payload and payload.stage == "failed" then
+            failed_at = failed_at or os.time()
+            -- 给 helper 2 秒把报错和输出冲干净，再停掉卡住的包装进程
+            if os.time() - failed_at >= 2 then
+                terminal_error = tostring(payload.message or "ASR helper 执行失败")
+                kill_background_process(pid_file)
+                stop_polling()
+                return
+            end
+        end
+        if os.time() - last_process_check_at >= 2 then
+            last_process_check_at = os.time()
+            local pid = tonumber(trim_text(read_text_file(pid_file) or ""))
+            local alive = pid and asr_process_is_alive(pid)
+            if alive == true then
+                missing_process_checks = 0
+            elseif alive == false then
+                missing_process_checks = missing_process_checks + 1
+                if missing_process_checks >= 2 then
+                    terminal_error = "ASR helper 已退出，但未返回完成状态；请查看诊断日志"
+                    stop_polling()
+                end
+            end
+            -- 上游还有一条"10 秒拿不到 pid 就判启动失败"，这里不能照抄：
+            -- Windows 的 pid 是批处理里 powershell 写进来的，可能合法缺失，据此判定会误杀正在跑的识别
         end
     end)
     if not timer_registered then
@@ -3927,12 +4126,21 @@ local function run_background_command_with_progress(cmd, progress_path, progress
 
     output = read_text_file(stdout_file) or ""
     local exit_code = tonumber(trim_text(read_text_file(exit_file) or "")) or 1
-    subfix_remove_files(stdout_file, pid_file, done_file, exit_file, batch_file)
+    local succeeded = exit_code == 0 and not terminal_error
+    subfix_remove_files(pid_file, done_file, exit_file, batch_file)
+    if succeeded or cancelled then
+        subfix_remove_files(stdout_file)
+    else
+        -- 失败时保留 helper 的输出并把路径写进报错，否则用户只看到"失败了"三个字
+        if terminal_error then output = terminal_error .. "\n" .. output end
+        if trim_text(output) == "" then output = "ASR helper 异常退出 (" .. tostring(exit_code) .. ")" end
+        output = output .. "\n诊断日志: " .. stdout_file
+    end
 
     if cancelled then
         return false, "已取消", "cancelled"
     end
-    return exit_code == 0, output, nil
+    return succeeded, output, nil
 end
 
 local function selected_sources_effective_audio_seconds(sources, fps)
@@ -4646,7 +4854,7 @@ local function generate_selection_subtitles()
     cancel_postprocess_if_requested(update_generate_postprocess_stage(
         progress_state, "解析结果", "正在解析生成结果", 96
     ))
-    local raw_generated_rows, raw_generated_err = parse_generated_json_subtitle_rows(json_path)
+    local raw_generated_rows, raw_generated_err, generation_trace = parse_generated_json_subtitle_rows(json_path)
     if not raw_generated_rows then
         finish_generate_progress_window(progress_state, "失败", raw_generated_err)
         error(raw_generated_err)
@@ -4717,7 +4925,17 @@ local function generate_selection_subtitles()
         finish_generate_progress_window(progress_state, "失败", import_err)
         error(import_err)
     end
-    finish_generate_progress_window(progress_state, "完成", "选区字幕已生成并写回时间线")
+    local completion_message = "选区字幕已生成并写回时间线"
+    if type(generation_trace) == "table" and generation_trace.run_id then
+        local run_id = tostring(generation_trace.run_id)
+        completion_message = completion_message .. "｜版本记录 " .. run_id:sub(1, 8)
+        if generation_trace.history_status == "saved" then
+            print("[SubFix Generate] 版本记录 " .. run_id .. ": " .. resolve_asr_paths().generation_history .. "/" .. run_id .. ".json")
+        else
+            print("[SubFix Generate] 版本历史未保存 (" .. tostring(generation_trace.history_error_type or "unknown") .. ")，本次记录仍在生成 JSON 中: " .. json_path)
+        end
+    end
+    finish_generate_progress_window(progress_state, "完成", completion_message)
     pcall(function() progress_state.window:Hide() end)
     print("[SubFix Generate] 生成选区字幕完成，诊断: " .. audio_diag_path)
     return true
@@ -4762,3 +4980,4 @@ function SubFixGenerateSelectionCore.run(options)
 end
 
 return SubFixGenerateSelectionCore
+

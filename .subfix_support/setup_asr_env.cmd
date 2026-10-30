@@ -31,7 +31,8 @@ set "PIP_INDEX=-i https://pypi.tuna.tsinghua.edu.cn/simple"
 if "%SUBFIX_INSTALL_QWEN_ASR%"=="0" (
   echo 已按 SUBFIX_INSTALL_QWEN_ASR=0 跳过 Qwen3-ASR。v4 生成字幕将不可用。
 ) else (
-  "%VENV_DIR%\Scripts\python.exe" -m pip install -U qwen-asr %PIP_INDEX% || "%VENV_DIR%\Scripts\python.exe" -m pip install -U qwen-asr || goto :fail
+  rem pypinyin 供文稿校对的同音字纠错使用，识别环境缺它校对只会降级成标点修正
+  "%VENV_DIR%\Scripts\python.exe" -m pip install -U qwen-asr pypinyin %PIP_INDEX% || "%VENV_DIR%\Scripts\python.exe" -m pip install -U qwen-asr pypinyin || goto :fail
   echo Qwen3-ASR 已安装。首次生成会下载 Qwen/Qwen3-ASR-1.7B。
 )
 

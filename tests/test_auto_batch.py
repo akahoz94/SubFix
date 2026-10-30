@@ -84,13 +84,19 @@ def test_env_overrides_everything(fake_torch, monkeypatch):
     assert model.max_inference_batch_size == 3
 
 
-def test_remembered_lesson_beats_tier(fake_torch, monkeypatch):
+def test_remembered_lesson_no_longer_pins_the_session(fake_torch, monkeypatch):
+    """常规降档不再跨窗钉死：显存宽松回来就跟着回升。
+
+    旧实现把 _AUTO_BATCH_STATE["value"] 当单向棘轮，一次早高峰读到的低档会让
+    后面几十个窗口全跑在批 1（40 分钟素材凭空多花近一倍时间）。真溢出由
+    oom_batch 单独记，那才是硬地板。
+    """
     monkeypatch.delenv("SUBFIX_QWEN3_ASR_MAX_BATCH", raising=False)
     mod._AUTO_BATCH_STATE["value"] = 1
     fake_torch(8.0)
-    model = types.SimpleNamespace(max_inference_batch_size=4)
+    model = types.SimpleNamespace(max_inference_batch_size=1)
     mod._apply_auto_batch_size(model)
-    assert model.max_inference_batch_size == 1
+    assert model.max_inference_batch_size == 4
 
 
 def test_oom_halves_batch_and_retries_once(fake_torch, monkeypatch):

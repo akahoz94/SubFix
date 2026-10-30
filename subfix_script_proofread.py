@@ -9,7 +9,7 @@
 - 幂等：行内保留 transcript_text（原始转录），重校永远拿原始转录
   与新文稿 diff，不在校对结果上二次叠加，换稿重跑不污染。
 - 零模型：difflib + pypinyin（可选），毫秒级；pypinyin 缺失时降级
-  为只做标点修正，同音纠错自动失效，绝不误改。
+  为只做标点修正，同音纠错自动失效，绝不误改——但失效必须让用户看见。
 
 纯函数模块，无内部依赖——未来迁入 service 包时原样搬运。
 """
@@ -29,6 +29,18 @@ try:
     from pypinyin import lazy_pinyin
 except Exception:  # pragma: no cover - 依赖缺失走保守降级
     lazy_pinyin = None
+
+# 可用性是显式状态，不是"悄悄不纠错"：管线拿它向用户播报同音校对到底跑没跑。
+PINYIN_MISSING_MESSAGE = "同音字校对未启用：缺少 pypinyin（识别环境里 pip 安装后恢复）"
+
+
+def pinyin_available() -> bool:
+    return lazy_pinyin is not None
+
+
+def pinyin_missing_message() -> str:
+    """依赖在位返回空串；缺失返回要播给用户的那一行说明。"""
+    return "" if pinyin_available() else PINYIN_MISSING_MESSAGE
 
 
 def _is_word_char(character: str) -> bool:
@@ -75,7 +87,7 @@ def _empty_diagnostic(status: str) -> dict[str, Any]:
     return {
         "proofread_schema": PROOFREAD_SCHEMA,
         "proofread_status": status,
-        "proofread_pinyin_available": lazy_pinyin is not None,
+        "proofread_pinyin_available": pinyin_available(),
         "proofread_script_chars": 0,
         "proofread_block_count": 0,
         "proofread_homophone_replace_count": 0,

@@ -8,3 +8,18 @@
 import os
 
 os.environ.setdefault("SUBFIX_DISABLE_SILERO", "1")
+
+# Windows 10.0.26300 的挂载点安全策略拒绝 pathlib.resolve() 遍历 pytest 为
+# tmp_path 建的 "*current" junction（WinError 448），整个套件在清理阶段崩掉。
+# 死链接清理是纯外观功能，直接停用。
+try:
+    _noop = lambda root: None
+    import _pytest.pathlib as _pytest_pathlib
+
+    _pytest_pathlib.cleanup_dead_symlinks = _noop
+    import _pytest.tmpdir as _pytest_tmpdir
+
+    _pytest_tmpdir.cleanup_dead_symlinks = _noop
+except Exception:
+    pass
+

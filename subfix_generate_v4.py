@@ -8,6 +8,7 @@ import hashlib
 import itertools
 import json
 import math
+import os
 import re
 import statistics
 import wave
@@ -2270,6 +2271,193 @@ def _segmentation_length_parameters(
     return minimum, median, preferred_maximum, maximum
 
 
+# v3.3.6 断句规则总开关：默认关闭。改变的是「字如何分行与时序」，不是识别
+# 出来的字符流，但分行同样会改动用户时间线，所以按红线要求必须先过开关验证。
+EDITORIAL_BOUNDARY_ENV = "SUBFIX_V4_EDITORIAL_BOUNDARY"
+
+
+def _editorial_boundary_enabled() -> bool:
+    return str(os.getenv(EDITORIAL_BOUNDARY_ENV) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _leading_temporal_clause_boundary(units: list[dict[str, Any]]) -> int | None:
+    """时间状语开头、随后另起主语时返回该 unit 边界（1..len-1）。"""
+    text = "".join(normalize_text(unit.get("text")) for unit in units)
+    if len(text) < 18:
+        return None
+    match = re.match(
+        r"^(?:在|到了?|直到|从)[\u4e00-\u9fff0-9]{0,12}?"
+        r"(?:第[一二三四五六七八九十百两0-9]+(?:天|周|个月|年)|[之以][前后]|的时候)",
+        text,
+    )
+    if match is None or match.end() < 4:
+        return None
+    remainder = text[match.end():]
+    # 时间表达还挂着修饰语或日期区间时不能断开。
+    if len(remainder) < 6 or remainder.startswith((
+        "的", "里", "内", "外", "前", "后", "到", "至", "早上", "上午",
+        "中午", "下午", "晚上", "凌晨", "结束", "开始", "期间",
+    )):
+        return None
+    if not re.match(r"^[\u4e00-\u9fff]{2,6}?(?:就|便|已经|开始|正在)", remainder):
+        return None
+    offset = 0
+    for position, unit in enumerate(units, start=1):
+        offset += len(normalize_text(unit.get("text")))
+        if offset == match.end():
+            return position
+        if offset > match.end():
+            return None
+    return None
+
+
+def _copular_clause_boundary(units: list[dict[str, Any]]) -> int | None:
+    """长主语与完整的解释性谓语分开（判断句）。"""
+    text = "".join(normalize_text(unit.get("text")) for unit in units)
+    if len(text) < 18 or text.startswith((
+        "如果", "只要", "只有", "即使", "就算", "哪怕", "无论", "不管",
+    )):
+        return None
+    offsets: dict[int, int] = {}
+    offset = 0
+    for position, unit in enumerate(units, start=1):
+        offset += len(normalize_text(unit.get("text")))
+        offsets[offset] = position
+    for match in re.finditer(r"也?(?:就是|正是|才是|便是)", text):
+        subject = text[:match.start()]
+        predicate = text[match.start():]
+        # 短片段、未完成的修饰语、否定或嵌套的判断都不断。
+        if (len(subject) < 6 or len(predicate) < 6
+                or subject.endswith(("的", "地", "得", "不", "也", "把", "被", "让", "给", "跟", "和", "与", "或"))):
+            continue
+        position = offsets.get(match.start())
+        if position is not None:
+            return position
+    return None
+
+
+def _editorial_pause_boundary(units: list[dict[str, Any]], fps: float) -> int | None:
+    """长分句在文本模型打分之前先拿到一个可读断点。"""
+    lengths = [len(str(unit.get("text") or "")) or 1 for unit in units]
+    total = sum(lengths)
+    if total < 18 or len(units) < 2:
+        return None
+    gaps = [
+        max(0, int(right.get("start_frame") or 0) - int(left.get("end_frame") or 0))
+        for left, right in zip(units, units[1:])
+    ]
+    # 均匀的对齐间距不是停顿，停顿要有局部显著性。
+    minimum_gap = max(math.ceil(0.08 * fps), statistics.median(gaps) + math.ceil(0.06 * fps))
+    # 偏移与词边界都按 unit 原文长度计（同 _hard_cut_boundaries），
+    # 含空格/ASCII 的行才不会因两套坐标错位而漏判。
+    word_bounds = _unit_word_boundary_positions(units)
+    candidates: list[tuple[float, int, int, int]] = []
+    offset = 0
+    for position, gap in enumerate(gaps, start=1):
+        offset += lengths[position - 1]
+        if offset < 4 or total - offset < 4 or offset not in word_bounds:
+            continue
+        punctuation = float(units[position - 1].get("asr_punctuation_strength") or 0.0)
+        if punctuation <= 0.0 and gap < minimum_gap:
+            continue
+        # 微停顿只对长行有帮助；更强的分句边界已经用过之后，
+        # 不要把剩下的可读片段继续切碎。
+        if punctuation <= 0.0 and total <= 20 and gap < math.ceil(0.25 * fps):
+            continue
+        candidates.append((punctuation, gap, -abs(total - 2 * offset), position))
+    return max(candidates)[-1] if candidates else None
+
+
+SENTENCE_MERGE_ENV = "SUBFIX_V4_SENTENCE_MERGE"
+SENTENCE_MERGE_MAX_GAP_SECONDS = 1.2
+# 被标成句末、但后面紧跟没说停的，多半是 ASR 把标点打错了，不该在这里收口。
+SENTENCE_MERGE_MIN_CLOSE_GAP_SECONDS = 0.35
+
+
+def _sentence_merge_enabled() -> bool:
+    # 默认开：呼吸级碎条是用户真正投诉的；设 0 就回到旧的分进行为。
+    return str(os.getenv(SENTENCE_MERGE_ENV) or "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _merge_rows_into_sentences(
+    rows: list[dict[str, Any]],
+    ordered: list[dict[str, Any]],
+    fps: float,
+    max_chars: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """把相邻小行拼回整句：只在句末标点处收口。
+
+    分句按 0.8 秒呼吸就断，所以必须允许跨过呼吸（阈值 1.2 秒），否则"整句"
+    组不起来；但不跨换轨、不跨超长停顿、不超字数上限。行是单元的连续切片，
+    所以用字符数把每行对回单元区间，拿到行尾单元的标点强度与行间的真实间隔。
+    """
+    if len(rows) < 2:
+        return rows, 0
+    max_gap_frames = int(round(SENTENCE_MERGE_MAX_GAP_SECONDS * (float(fps) or 25.0)))
+    min_close_gap_frames = int(round(SENTENCE_MERGE_MIN_CLOSE_GAP_SECONDS * (float(fps) or 25.0)))
+    # 行是单元的连续切片：按字符数把每行对回它最后/最先那个单元。
+    # 判"换轨"必须用单元自己的 track_index（素材轨），行的 speaker_track_index 是
+    # 说话人平滑后的结果，两者可以不同，拿它比较会把大量正常接缝误判成换轨。
+    row_last_unit: list[dict[str, Any]] = []
+    row_first_unit: list[dict[str, Any]] = []
+    cursor = 0
+    for row in rows:
+        length = max(1, len(str(row.get("text") or "")))
+        row_first_unit.append(ordered[min(cursor, len(ordered) - 1)])
+        cursor += length
+        row_last_unit.append(ordered[min(cursor, len(ordered)) - 1])
+
+    def ends_sentence(prev_unit: dict[str, Any], next_unit: dict[str, Any]) -> bool:
+        marked = float(prev_unit.get("asr_punctuation_strength") or 0.0) >= 1.0 or _is_break_punctuation(
+            str(prev_unit.get("text") or ""))
+        if not marked:
+            return False
+        return int(next_unit.get("start_frame") or 0) - int(prev_unit.get("end_frame") or 0) >= min_close_gap_frames
+
+    merged: list[dict[str, Any]] = []
+    pending = dict(rows[0])
+    joined = 0
+    for index in range(1, len(rows)):
+        row = rows[index]
+        prev_unit = row_last_unit[index - 1]
+        next_unit = row_first_unit[index]
+        seam_gap = int(row.get("start_frame") or 0) - int(pending.get("end_frame") or 0)
+        combined = len(str(pending.get("text") or "")) + len(str(row.get("text") or ""))
+        can_join = (
+            not ends_sentence(prev_unit, next_unit)
+            and int(prev_unit.get("track_index") or 0) == int(next_unit.get("track_index") or 0)
+            and seam_gap <= max_gap_frames
+            and combined <= max_chars
+        )
+        if can_join:
+            pending["text"] = str(pending.get("text") or "") + str(row.get("text") or "")
+            pending["end_frame"] = int(row.get("end_frame") or pending.get("end_frame") or 0)
+            pending["independent_vad"] = bool(pending.get("independent_vad") or row.get("independent_vad"))
+            joined += 1
+            continue
+        merged.append(pending)
+        pending = dict(row)
+    merged.append(pending)
+    for position, row in enumerate(merged, start=1):
+        row["index"] = position
+    return merged, joined
+
+
+DEFAULT_SENTENCE_MERGE_MAX_CHARS = 18  # 用户没选字幕长度时，按本仓 live 默认上限收口
+
+
+def _apply_sentence_merge(
+    rows: list[dict[str, Any]],
+    ordered: list[dict[str, Any]],
+    fps: float,
+    max_chars: int | None,
+) -> tuple[list[dict[str, Any]], int]:
+    if not _sentence_merge_enabled() or len(rows) < 2:
+        return rows, 0
+    return _merge_rows_into_sentences(
+        rows, ordered, fps, int(max_chars or DEFAULT_SENTENCE_MERGE_MAX_CHARS))
+
+
 def segment_canonical_units(
     units: list[dict[str, Any]],
     mode: str,
@@ -2297,6 +2485,18 @@ def segment_canonical_units(
             or float(ordered[position - 1].get("asr_punctuation_strength") or 0.0) >= 1.0
         )
     ]
+    editorial_boundary = None
+    if _editorial_boundary_enabled():
+        # 编辑级边界沿用硬边界的真实 unit 时间，因此要一起逃过下方
+        # 「未超上限就不拆」的快路径与短行惩罚；只考察首个区间。
+        first_region = ordered[:hard_positions[0]] if hard_positions else ordered
+        editorial_boundary = (
+            _leading_temporal_clause_boundary(first_region)
+            or _copular_clause_boundary(first_region)
+            or _editorial_pause_boundary(first_region, fps)
+        )
+    if editorial_boundary is not None:
+        hard_positions = sorted({*hard_positions, editorial_boundary})
     if hard_positions:
         rows: list[dict[str, Any]] = []
         start = 0
@@ -2328,6 +2528,7 @@ def segment_canonical_units(
         actual_text = "".join(normalize_text(row.get("text")) for row in rows)
         if actual_text != expected_text:
             raise RuntimeError("v4 segmentation text conservation failed")
+        rows, sentence_merged_count = _apply_sentence_merge(rows, ordered, fps, max_chars)
         return rows, {
             "ordinary_single_character_count": sum(
                 1
@@ -2339,6 +2540,7 @@ def segment_canonical_units(
             "short_reply_suppressed_count": short_reply_suppressed,
             "hard_boundary_count": len(hard_positions),
             "single_unit_merged_count": single_unit_merged_count,
+            "sentence_merged_count": sentence_merged_count,
             "incomplete_clause_merged_count": incomplete_merged,
             "orphan_segment_merged_count": orphan_merged,
             "short_gap_filled_count": short_gap_filled,
@@ -2346,16 +2548,31 @@ def segment_canonical_units(
             "max_chars_applied": max_chars_applied,
         }
     mode_profile = ((profile or {}).get("modes") or {}).get(mode) if profile and isinstance(profile.get("modes"), dict) else profile
+    # 开关打开后短片段只认非模型证据：模型概率再高也不能单独把动词短语摘出来。
+    # split_penalty 处仍然带上 mode_profile，保持原有代价分级。
+    guard_profile = None if _editorial_boundary_enabled() else mode_profile
     preferred_min, preferred_center, preferred_max, hard_max = _segmentation_length_parameters(
         mode,
         mode_profile,
         max_chars=max_chars,
     )
     count = len(ordered)
-    if count <= hard_max and not any(
+    # 主语已被分离的解释性谓语不该再被对齐间隙切碎；这里的
+    # compact_predicate 在开关关闭时恒为 False，判定与今天一致。
+    compact_predicate = _editorial_boundary_enabled() and (
+        len(expected_text) <= min(16, hard_max)
+        and re.match(r"^也?(?:就是|正是|才是|便是)", expected_text) is not None
+        and not any(
+            float(unit.get("asr_punctuation_strength") or 0.0) > 0.0
+            or _is_break_punctuation(str(unit.get("text") or ""))
+            for unit in ordered[:-1]
+        )
+        and not any(starter in expected_text[2:] for starter in CLAUSE_STARTERS)
+    )
+    if count <= hard_max and (compact_predicate or not any(
         _has_non_model_boundary_evidence(ordered, position, fps, mode_profile)
         for position in range(1, count)
-    ):
+    )):
         row = {
             "index": 1,
             "text": "".join(str(unit.get("text") or "") for unit in ordered),
@@ -2394,9 +2611,9 @@ def segment_canonical_units(
                 end_strength = boundary_score if end < count else 3.0
                 if len(normalized) < 3 or min(start_strength, end_strength) < 3.0:
                     continue
-                if start > 0 and not _has_non_model_boundary_evidence(ordered, start, fps, mode_profile):
+                if start > 0 and not _has_non_model_boundary_evidence(ordered, start, fps, guard_profile):
                     continue
-                if end < count and not _has_non_model_boundary_evidence(ordered, end, fps, mode_profile):
+                if end < count and not _has_non_model_boundary_evidence(ordered, end, fps, guard_profile):
                     continue
                 strong_short_clause = True
             length_score = -abs(length - preferred_center) * 0.25
@@ -2446,7 +2663,12 @@ def segment_canonical_units(
     actual_text = "".join(normalize_text(row.get("text")) for row in finalized_rows)
     if actual_text != expected_text:
         raise RuntimeError("v4 segmentation text conservation failed")
+    finalized_rows, sentence_merged_count = _apply_sentence_merge(
+        finalized_rows, ordered, fps, max_chars)
+    if "".join(normalize_text(row.get("text")) for row in finalized_rows) != expected_text:
+        raise RuntimeError("v4 sentence merge broke text conservation")
     finalized_diagnostic["single_unit_merged_count"] = single_unit_merged_count
+    finalized_diagnostic["sentence_merged_count"] = sentence_merged_count
     finalized_diagnostic["text_conservation_failed_count"] = 0
     finalized_diagnostic["max_chars_applied"] = max_chars_applied
     return finalized_rows, finalized_diagnostic

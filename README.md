@@ -7,7 +7,7 @@ DaVinci Resolve 字幕插件的独立 Windows 分支（fork 自 HooperH/SubFix�
 
 | 包 | 内容 | 适用 |
 |---|---|---|
-| `SubFix-v*-Windows.zip` | 插件本体，依赖系统 Python/ffmpeg | 已装 Python 的机器 |
+| `SubFix-v*-Windows.zip` | 插件本体 + GGUF 引擎的 python 部分（**GPU 运行时与权重都不打包**，见下方「GGUF 运行时放外部」），依赖系统 Python/ffmpeg | 已装 Python 的机器 |
 | `SubFix-v*-Windows-Full.zip` | 内置 Python 3.11 运行时与 ffmpeg（含 DLL） | 免装依赖 |
 | `SubFix-v*-Windows-Full-Max.zip` | Full + 自编译 qwen3-asr-cli 加速对齐（GGUF 模型） | 全离线 |
 | `SubFix-v*-Windows-Setup.exe` | Inno Setup 安装器（简体中文向导，可静默 `/VERYSILENT`） | 常规安装 |
@@ -66,9 +66,15 @@ Windows 轻量包不内置 Python 运行时与 FFmpeg，这两项由系统提供
 
 - 字幕目标轨由插件 UI 的轨道下拉框经 Resolve API（mediaPool:AppendToTimeline 等）控制。
 - 在线更新已停用；请到 GitHub Releases 手动更新。
-- 强制对齐加速：qwen3-asr.cpp 无官方 Windows 构建，本分支用 MinGW-w64 自编译
-  （`dist` 的 Max 包已内置 qwen3-asr-cli 与对齐 GGUF）；轻量/Full 包识别走 Python 环境（qwen-asr），
-  结果一致、速度略慢。
+- **GGUF 运行时与权重都放外部**。三种包型都带 GGUF **整条 ASR** 引擎的 python 部分
+  （`subfix_qwen3_gguf.py` + `qwen_asr_gguf/`，`auto` 优先用它），但 GPU 运行目录随包发会把
+  轻量包撑到 630MB，所以一律不发。要启用加速，把两样放到安装目录的 `.subfix_support\`：
+  权重 → `models\qwen3-asr-gguf\`（或设 `SUBFIX_QWEN3_GGUF_MODEL_DIR`），
+  llama.cpp 运行目录 → `models\qwen3-asr-gguf-runtime\bin-vulkan\`（或设
+  `SUBFIX_QWEN3_GGUF_BIN` 指向含 `bin` / `bin-vulkan` 的目录）。
+  实测 3060 Ti：CUDA RTF 0.108（Max 包 `--qwen-cpp` 那条自己拷 `bin`）、Vulkan 0.155，
+  两样都没有就回退 Python 环境的 qwen-asr（RTF≈1，结果一致、只是慢）。
+  缺哪一样都会在进度里点名说，不会假装加速还在。
 - 后台任务通过 cmd 批处理 + PowerShell 记录 PID，取消按钮用 taskkill 终止进程树。
 - 安装/卸载为 bat 脚本与 Inno Setup 安装器。
 

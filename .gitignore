@@ -46,3 +46,10 @@ docs/superpowers/
 # 构建产物与本地缓存
 dist/
 .build_cache/
+
+# qwen3_gguf 快速引擎：Python/Lua 源码入库，但两套 llama.cpp GPU 后端 DLL
+# （bin=CUDA 含 cublasLt 473MB，bin-vulkan）超 GitHub 100MB 硬限，走本地
+# staged —— 构建脚本 build_windows_zip.py 从仓库树直接取，新机器需先放置。
+qwen_asr_gguf/inference/bin/
+qwen_asr_gguf/inference/bin-vulkan/
+.pytest_tmp/
