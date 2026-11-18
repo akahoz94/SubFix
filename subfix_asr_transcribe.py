@@ -4199,8 +4199,16 @@ def cut_audio(
     if source_end is not None and source_end > source_start:
         cmd.extend(["-to", f"{source_end:.3f}"])
     cmd.extend(["-i", str(audio)])
+    filters = []
     if audio_channel_index is not None and audio_channel_index > 0:
-        cmd.extend(["-filter:a", f"pan=mono|c0=c{audio_channel_index - 1}"])
+        filters.append(f"pan=mono|c0=c{audio_channel_index - 1}")
+    if source_end is not None and source_end > source_start:
+        # 上游 v3.4.0：输入 -to 跟随包时间戳，损坏的时间戳会多解出样本，
+        # 让识别范围超出选区——按样本数硬截
+        max_samples = max(1, round((source_end - source_start) * 16000))
+        filters.extend(["aresample=16000", f"atrim=end_sample={max_samples}"])
+    if filters:
+        cmd.extend(["-filter:a", ",".join(filters)])
     cmd.extend(["-ac", "1", "-ar", "16000", "-vn", str(output)])
     try:
         subprocess.run(

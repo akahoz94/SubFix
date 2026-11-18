@@ -2101,6 +2101,28 @@ def _fill_short_segment_gaps(rows: list[dict[str, Any]], fps: float) -> int:
     return filled
 
 
+def _merge_same_frame_segment_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """同一条字幕轨不能在同一帧并排显示两条，同起始帧又会被下游当成重叠。
+
+    上游 v3.3.9：多个对齐字符量化到同一帧时，分句会产出同起始帧的两条，之后
+    "字幕原始对齐范围重叠，无法安全修正边界" 就是在这里长出来的。
+    """
+    output: list[dict[str, Any]] = []
+    for source in rows:
+        row = dict(source)
+        if (output
+                and int(output[-1].get("start_frame") or 0) == int(row.get("start_frame") or 0)
+                and output[-1].get("speaker_track_index") == row.get("speaker_track_index")):
+            previous = output[-1]
+            previous["text"] = str(previous.get("text") or "") + str(row.get("text") or "")
+            previous["end_frame"] = max(int(previous["end_frame"]), int(row["end_frame"]))
+            previous["independent_vad"] = bool(previous.get("independent_vad") or row.get("independent_vad"))
+            previous["segmentation_decision"] = "merged_same_frame_boundary"
+        else:
+            output.append(row)
+    return output
+
+
 def _finalize_segment_rows(rows: list[dict[str, Any]], fps: float, mode: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
     minimum_frames = max(1, int(math.ceil(0.18 * fps)))
     prepared = [dict(row) for row in rows]
@@ -2131,6 +2153,7 @@ def _finalize_segment_rows(rows: list[dict[str, Any]], fps: float, mode: str) ->
             index += 1
         prepared = merged_rows
     accepted, orphan_merged = _merge_orphan_segment_rows(prepared, fps)
+    accepted = _merge_same_frame_segment_rows(accepted)
     for index, row in enumerate(accepted):
         start = int(row.get("start_frame") or 0)
         desired_end = max(int(row.get("end_frame") or start + 1), start + minimum_frames)
@@ -2513,6 +2536,7 @@ def segment_canonical_units(
             short_gap_filled += int(group_diagnostic.get("short_gap_filled_count") or 0)
             start = end
         rows, orphan_merged = _merge_orphan_segment_rows(rows, fps)
+        rows = _merge_same_frame_segment_rows(rows)
         minimum_frames = max(1, int(math.ceil(0.18 * fps)))
         for index in range(len(rows) - 1):
             left = rows[index]
@@ -2855,9 +2879,16 @@ def protect_word_boundaries(
             right["text"] = right["text"][move_count:]
             right["units"] = right["units"][move_count:]
             if right["text"]:
-                boundary_frame = int(right["units"][0].get("start_frame") or right["end_frame"])
-                left["end_frame"] = boundary_frame
-                right["start_frame"] = boundary_frame
+                boundary_frame = int(right["units"][0].get("start_frame") or 0)
+                if left["start_frame"] < boundary_frame < right["end_frame"]:
+                    left["end_frame"] = boundary_frame
+                    right["start_frame"] = boundary_frame
+                else:
+                    # 量化后的词时间两边留不出正时长时，保住完整文字，别硬造一帧重叠。
+                    left["text"] += right["text"]
+                    left["units"] += right["units"]
+                    left["end_frame"] = max(left["end_frame"], right["end_frame"])
+                    del entries[index + 1]
             else:
                 left["end_frame"] = right["end_frame"]
                 del entries[index + 1]
@@ -3042,13 +3073,21 @@ def enforce_hard_char_limit(
         if len(text) <= max_chars or len(row_units) < 2:
             output.append(row)
             continue
-        boundaries = _hard_cut_boundaries(row_units, max_chars, tokenizer)
+        original_start = int(row.get("start_frame") or 0)
+        original_end = int(row.get("end_frame") or 0)
+        boundaries = []
+        previous_frame = original_start
+        # 多个对齐字符可能量化到同一帧，或落在被回收的尾巴之外；
+        # 这种切点切不出正时长，宁可整条不切，也别硬造 1 帧重叠。
+        for boundary in _hard_cut_boundaries(row_units, max_chars, tokenizer):
+            frame = int(row_units[boundary].get("start_frame") or 0)
+            if previous_frame < frame < original_end:
+                boundaries.append(boundary)
+                previous_frame = frame
         if not boundaries:
             output.append(row)
             continue
         edges = [0, *boundaries, len(row_units)]
-        original_start = int(row.get("start_frame") or 0)
-        original_end = int(row.get("end_frame") or 0)
         for position in range(len(edges) - 1):
             slice_start, slice_end = edges[position], edges[position + 1]
             sub_units = row_units[slice_start:slice_end]
@@ -3063,7 +3102,6 @@ def enforce_hard_char_limit(
             else:
                 next_unit_start = int(row_units[slice_end].get("start_frame") or 0)
                 sub_row["end_frame"] = next_unit_start
-            sub_row["end_frame"] = max(sub_row["end_frame"], sub_row["start_frame"] + 1)
             sub_row["segmentation_decision"] = "hard_char_split"
             output.append(sub_row)
         split_count += 1
